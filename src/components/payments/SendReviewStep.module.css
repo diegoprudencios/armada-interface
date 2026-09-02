@@ -98,7 +98,7 @@
 .cancelButton {
   background: var(--semantic-color-frost-raised);
   border: calc(var(--primitives-borderWidth-default) * 1px) solid
-    color-mix(in srgb, var(--primitives-color-neutral-50) 14%, transparent);
+    color-mix(in srgb, var(--semantic-color-surface-default) 14%, transparent);
   color: var(--semantic-color-text-primary);
 }
 

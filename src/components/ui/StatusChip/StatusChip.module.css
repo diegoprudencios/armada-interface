@@ -9,7 +9,7 @@
   padding: 0 10px;
   border-radius: calc(var(--primitives-borderRadius-full) * 1px);
   border: 1px solid transparent;
-  background: var(--primitives-color-neutral-100);
+  background: var(--semantic-color-surface-raised);
   color: var(--semantic-color-text-secondary);
   white-space: nowrap;
 }
@@ -28,7 +28,7 @@
 }
 
 .neutral {
-  background: var(--primitives-color-neutral-100);
+  background: var(--semantic-color-surface-raised);
   border-color: var(--semantic-color-border-default);
   color: var(--semantic-color-text-secondary);
 }

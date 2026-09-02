@@ -130,7 +130,7 @@
 /* Dark: the QR (currentColor modules on transparent) needs a light plate to stay scannable, so
    the box goes solid white with dark-ink modules. */
 :global([data-theme='dark']) .qrBox {
-  background: var(--primitives-color-white-full);
+  background: var(--semantic-color-surface-paper);
   color: var(--semantic-color-brand-ink);
 }
 

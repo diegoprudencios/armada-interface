@@ -10,7 +10,7 @@
   gap: var(--primitives-spacing-2);
   padding-inline: var(--primitives-spacing-2);
   border: calc(var(--primitives-borderWidth-default) * 1px) solid
-    color-mix(in srgb, var(--primitives-color-neutral-50) 7%, transparent);
+    color-mix(in srgb, var(--semantic-color-surface-default) 7%, transparent);
   border-radius: calc(var(--semantic-borderRadius-item) * 1px);
   background: transparent;
 }

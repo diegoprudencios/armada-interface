@@ -48,7 +48,7 @@ button.root:active::before {
 }
 
 :global([data-theme='light'][data-dashboard-bg='solid']) .root::before {
-  background: var(--primitives-color-neutral-100);
+  background: var(--semantic-color-surface-raised);
 }
 
 :global([data-theme='light'][data-dashboard-bg='solid']) button.root:active::before {

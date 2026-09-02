@@ -12,7 +12,7 @@
   --semantic-color-brand-amber: #f8d197;
   --semantic-color-brand-gradient-rose: #f39db0;
 
-  --semantic-color-frost-pigment: var(--primitives-color-neutral-50);
+  --semantic-color-frost-pigment: var(--semantic-color-surface-default);
   --semantic-motion-theme: 320ms;
   --semantic-size-sheet-max: 88dvh;
 }
@@ -24,7 +24,7 @@
   in dark (same 10% as chips — a solid white brick would be too loud).
 */
 [data-theme='light'] {
-  --semantic-color-frost-pigment: var(--primitives-color-neutral-50);
+  --semantic-color-frost-pigment: var(--semantic-color-surface-default);
   --semantic-color-frost: color-mix(in srgb, var(--semantic-color-frost-pigment) 20%, transparent);
   --semantic-color-frost-raised: color-mix(in srgb, var(--semantic-color-frost-pigment) 40%, transparent);
   --semantic-color-frost-control: var(--semantic-color-frost-raised);
@@ -36,7 +36,7 @@
   --semantic-color-surface-tooltip: var(--semantic-color-surface-default);
   --semantic-color-overlay: rgb(0 0 0 / 0.36);
   --semantic-color-overlay-flow: color-mix(in srgb, var(--primitives-color-amber-300) 30%, transparent);
-  --semantic-color-surface-segment: var(--primitives-color-neutral-50);
+  --semantic-color-surface-segment: var(--semantic-color-surface-default);
   --semantic-color-text-on-segment: var(--semantic-color-text-primary);
   --semantic-color-surface-main: var(--semantic-color-frost-raised);
   --semantic-component-button-secondary-bg: var(--semantic-color-surface-main);
@@ -52,17 +52,17 @@
   --semantic-color-surface-raised-hover: color-mix(
     in srgb,
     var(--primitives-color-neutral-200) 40%,
-    var(--primitives-color-neutral-100)
+    var(--semantic-color-surface-raised)
   );
   --semantic-color-surface-raised-pressed: color-mix(
     in srgb,
     var(--primitives-color-neutral-200) 55%,
-    var(--primitives-color-neutral-100)
+    var(--semantic-color-surface-raised)
   );
 }
 
 [data-theme='dark'] {
-  --semantic-color-frost-pigment: var(--primitives-color-white-full);
+  --semantic-color-frost-pigment: var(--semantic-color-ink-full);
   --semantic-color-frost: color-mix(in srgb, var(--semantic-color-frost-pigment) 3%, transparent);
   --semantic-color-frost-raised: color-mix(in srgb, var(--semantic-color-frost-pigment) 8%, transparent);
   --semantic-color-frost-control: color-mix(in srgb, var(--semantic-color-frost-pigment) 10%, transparent);
@@ -73,12 +73,12 @@
   --semantic-color-surface-banner: var(--semantic-color-frost-control);
   --semantic-color-surface-tooltip: color-mix(
     in srgb,
-    var(--primitives-color-white-full) 16%,
+    var(--semantic-color-ink-full) 16%,
     var(--semantic-color-surface-bg)
   );
   --semantic-color-overlay: rgb(0 0 0 / 0.72);
   --semantic-color-overlay-flow: var(--semantic-color-overlay);
-  --semantic-color-surface-segment: var(--primitives-color-white-full);
+  --semantic-color-surface-segment: var(--semantic-color-ink-full);
   --semantic-color-text-on-segment: var(--semantic-color-brand-ink);
   --semantic-color-surface-main: var(--semantic-color-frost-raised);
   --semantic-component-button-secondary-bg: var(--semantic-color-surface-main);
@@ -89,12 +89,12 @@
   --semantic-color-surface-raised-hover: color-mix(
     in srgb,
     var(--primitives-color-neutral-200) 40%,
-    var(--primitives-color-neutral-100)
+    var(--semantic-color-surface-raised)
   );
   --semantic-color-surface-raised-pressed: color-mix(
     in srgb,
     var(--primitives-color-neutral-200) 55%,
-    var(--primitives-color-neutral-100)
+    var(--semantic-color-surface-raised)
   );
 }
 
