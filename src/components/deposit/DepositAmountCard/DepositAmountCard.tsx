@@ -21,9 +21,26 @@ function prefersReducedMotion(): boolean {
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches
 }
 
-/** Roll animation lifetime for a target value — long enough for the odometer + digit stagger to settle. */
-function amountRollMs(formatted: string): number {
-  const digitCount = formatted.replace(/\D/g, '').length
+function amountPartLengths(value: string): { intDigits: number; fracDigits: number } {
+  const cleaned = value.replace(/,/g, '')
+  const dot = cleaned.indexOf('.')
+  const intPart = (dot === -1 ? cleaned : cleaned.slice(0, dot)) || '0'
+  const fracPart = dot === -1 ? '' : cleaned.slice(dot + 1)
+  return { intDigits: Math.max(intPart.length, 1), fracDigits: fracPart.length }
+}
+
+/**
+ * Digit columns the odometer actually paints. It pads the shorter amount so the decimal points
+ * line up, which can be wider than either stored string.
+ */
+function rollDigitCount(fromValue: string, toValue: string): number {
+  const from = amountPartLengths(fromValue)
+  const to = amountPartLengths(toValue)
+  return Math.max(from.intDigits, to.intDigits) + Math.max(from.fracDigits, to.fracDigits)
+}
+
+/** Roll lifetime for a column count — long enough for the odometer and its per-digit stagger. */
+function amountRollMs(digitCount: number): number {
   return BALANCE_ROLL_DURATION_MS + Math.max(0, digitCount - 1) * BALANCE_ROLL_DIGIT_STAGGER_MS + 80
 }
 
@@ -150,7 +167,7 @@ export function DepositAmountCard({
     rollTimerRef.current = setTimeout(() => {
       rollTimerRef.current = null
       setAmountRoll(null)
-    }, amountRollMs(toValue))
+    }, amountRollMs(rollDigitCount(fromValue, toValue)))
     // eslint-disable-next-line react-hooks/exhaustive-deps -- roll is keyed off the amount change only.
   }, [amount])
 
@@ -233,7 +250,7 @@ export function DepositAmountCard({
                 styles.amountDisplay,
                 showActiveAmount && styles.amountDisplayActive,
                 hasError && styles.amountDisplayError,
-                isAmountRolling && styles.amountValueHidden,
+                isAmountRolling && styles.amountDisplayRolling,
               ]
                 .filter(Boolean)
                 .join(' ')}
@@ -262,7 +279,12 @@ export function DepositAmountCard({
               readOnly={isAmountRolling}
             />
             {isAmountRolling && amountRoll ? (
-              <span className={styles.amountRollLayer} aria-hidden>
+              <span
+                className={[styles.amountRollLayer, hasError && styles.amountRollError]
+                  .filter(Boolean)
+                  .join(' ')}
+                aria-hidden
+              >
                 <RollingBalanceValue
                   key={amountRoll.trigger}
                   value={formatAmountInputDisplay(amountRoll.toValue)}

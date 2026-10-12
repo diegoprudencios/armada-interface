@@ -217,7 +217,11 @@
 .amountField {
   position: relative;
   display: inline-block;
+  /* As wide as the digits, never wider than the card. A longer roll clips at the end. */
+  width: max-content;
   max-width: 100%;
+  overflow: hidden;
+  vertical-align: top;
 }
 
 .amountDisplay,
@@ -231,10 +235,19 @@
 
 .amountDisplay {
   display: block;
-  text-align: right;
+  text-align: left;
+  white-space: nowrap;
   color: color-mix(in srgb, var(--semantic-color-text-primary) 30%, transparent);
   pointer-events: none;
   user-select: none;
+}
+
+/* Out of flow while the odometer is showing, so the roll — not the shorter stored string — sets
+   the field width. Otherwise the padded digit row is pinned to the right of a short box and the
+   first digit paints past the card's left padding. */
+.amountDisplayRolling {
+  position: absolute;
+  visibility: hidden;
 }
 
 .amountDisplayActive {
@@ -255,7 +268,7 @@
   padding: 0;
   border: none;
   background: transparent;
-  text-align: right;
+  text-align: left;
   color: transparent;
   caret-color: var(--semantic-color-text-primary);
   outline: none;
@@ -270,20 +283,27 @@
   outline: none;
 }
 
-/* Odometer overlay shown while a preset/Max roll plays — sits over the (hidden) static value,
-   right-aligned to match the amount. RollingBalanceValue owns the digit-spin motion. */
+/* In-flow odometer. It defines the field width (including the zeros used to line up decimals)
+   and starts at the left edge, so extra digits grow into the card instead of out of it.
+   RollingBalanceValue owns the digit-spin motion. */
 .amountRollLayer {
-  position: absolute;
-  inset: 0;
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
+  max-width: 100%;
   font-family: var(--primitives-fontFamily-mono), ui-monospace, monospace;
   font-size: calc(var(--primitives-fontSize-4xl) * 1px);
   font-weight: var(--primitives-fontWeight-regular);
   line-height: calc(var(--primitives-fontSize-4xl) * 1px);
+  font-variant-numeric: tabular-nums;
   color: var(--semantic-color-text-primary);
   pointer-events: none;
+  white-space: nowrap;
+}
+
+.amountRollError {
+  color: var(--semantic-color-status-error);
 }
 
 /* Hide the static value + caret during the roll so only the odometer shows. */
