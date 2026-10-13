@@ -187,6 +187,35 @@ function paddingFold(
   }
 }
 
+/** Time from roll start until the last (staggered) column has landed, plus the settle buffer. */
+function settleMsForColumns(columns: number, rollDurationMs: number, digitStaggerMs: number): number {
+  return rollDurationMs + Math.max(0, columns - 1) * digitStaggerMs + ROLL_SETTLE_BUFFER_MS
+}
+
+/**
+ * How long a roll to `value` takes to settle once it starts (excluding any `rollStartMs` delay). It
+ * counts every column the odometer rolls — a fromValue roll's alignment padding included — so it can
+ * run longer than `value`'s own digits suggest. For callers that end a roll on their own timer
+ * (e.g. one timer covering several odometers); a single odometer can use `onRollEnd` instead.
+ */
+export function rollSettleMs(
+  value: string,
+  {
+    mode = 'fromZero',
+    fromValue,
+    rollDurationMs = balanceRevealRollDurationMs(),
+    digitStaggerMs = BALANCE_ROLL_DIGIT_STAGGER_MS,
+  }: {
+    mode?: BalanceRollMode
+    fromValue?: string
+    rollDurationMs?: number
+    digitStaggerMs?: number
+  } = {},
+): number {
+  const columns = buildDisplayTokens(value, mode, fromValue).filter((token) => token.type === 'digit')
+  return settleMsForColumns(columns.length, rollDurationMs, digitStaggerMs)
+}
+
 function digitEndOffset(fromDigit: number, toDigit: number): number {
   if (fromDigit === toDigit) return fromDigit
   const delta = (toDigit - fromDigit + 10) % 10
@@ -333,7 +362,7 @@ export function RollingBalanceValue({
   })
 
   // Every column (padding included) rolls, so the last one starts `(count - 1) × stagger` in.
-  const lastDigitIndex = tokens.filter((token) => token.type === 'digit').length - 1
+  const columnCount = tokens.filter((token) => token.type === 'digit').length
 
   useEffect(() => {
     if (!shouldRoll) {
@@ -341,11 +370,12 @@ export function RollingBalanceValue({
       return
     }
     if (!animating) return
-    const settleMs =
-      rollDurationMs + Math.max(0, lastDigitIndex) * digitStaggerMs + ROLL_SETTLE_BUFFER_MS
-    const timer = window.setTimeout(() => onRollEndRef.current?.(), settleMs)
+    const timer = window.setTimeout(
+      () => onRollEndRef.current?.(),
+      settleMsForColumns(columnCount, rollDurationMs, digitStaggerMs),
+    )
     return () => window.clearTimeout(timer)
-  }, [shouldRoll, animating, rollDurationMs, digitStaggerMs, lastDigitIndex])
+  }, [shouldRoll, animating, rollDurationMs, digitStaggerMs, columnCount])
 
   const rootClassName = [styles.root, className].filter(Boolean).join(' ')
 
