@@ -63,6 +63,20 @@
   transition: opacity 200ms ease-out;
 }
 
+/* fromValue rolls pad the shorter value with zeros to line up the decimal point. Those padding
+   columns fold to zero width instead of showing a 0, so the row starts as the old value and ends as
+   the new one. Duration and delay are set inline. Declared after the visibility rules so this
+   transition list wins on the columns that carry it. */
+.paddingFold {
+  transition-property: width, opacity;
+  transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.collapsed {
+  width: 0;
+  opacity: 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .digitTrackRoll {
     transition: none;

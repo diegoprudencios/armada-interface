@@ -9,6 +9,8 @@ import {
 import styles from './RollingBalanceValue.module.css'
 
 const DIGIT_SPIN_CYCLES = 1
+/** How long an alignment-padding column takes to fold away (or open) during a fromValue roll. */
+const PADDING_FOLD_MS = 450
 
 export type BalanceRollMode = 'fromZero' | 'fromValue'
 
@@ -22,9 +24,22 @@ type DisplayDigit = {
   digitIndex: number
   fromDigit: number
   toDigit: number
+  /** Whether this column is part of the starting / target value (false = alignment padding). */
+  inFrom: boolean
+  inTo: boolean
 }
 
-type DisplayToken = DisplayDigit | { type: 'separator'; char: string; key: string }
+type DisplaySeparator = {
+  type: 'separator'
+  char: string
+  key: string
+  /** Index of the digit column that follows, so the separator folds in step with it. */
+  digitIndex: number
+  inFrom: boolean
+  inTo: boolean
+}
+
+type DisplayToken = DisplayDigit | DisplaySeparator
 
 function tokenizeBalance(value: string): BalanceToken[] {
   const tokens: BalanceToken[] = []
@@ -74,14 +89,18 @@ function buildDisplayTokens(
 ): DisplayToken[] {
   if (mode !== 'fromValue' || !fromValue) {
     return tokenizeBalance(toValue).map((token, index, tokens) => {
-      if (token.type === 'separator') return { type: 'separator', char: token.char, key: token.key }
       const digitIndex = tokens.slice(0, index).filter((item) => item.type === 'digit').length
+      if (token.type === 'separator') {
+        return { type: 'separator', char: token.char, key: token.key, digitIndex, inFrom: true, inTo: true }
+      }
       return {
         type: 'digit',
         key: token.key,
         digitIndex,
         fromDigit: 0,
         toDigit: token.digit,
+        inFrom: true,
+        inTo: true,
       }
     })
   }
@@ -90,6 +109,13 @@ function buildDisplayTokens(
   const to = parseAmountParts(toValue)
   const intWidth = Math.max(from.intDigits.length, to.intDigits.length, 1)
   const fracWidth = Math.max(from.fracDigits.length, to.fracDigits.length)
+  const fromLengths = { int: from.intDigits.length, frac: from.fracDigits.length }
+  const toLengths = { int: to.intDigits.length, frac: to.fracDigits.length }
+  // The padding below is for alignment only and is never shown as zeros: a column that is padding in
+  // a value is collapsed while the row shows that value. Integer padding sits on the left, fraction
+  // padding on the right, so a column is real when it falls inside that value's own digits.
+  const isRealColumn = (column: number, lengths: { int: number; frac: number }) =>
+    column < intWidth ? column >= intWidth - lengths.int : column - intWidth < lengths.frac
 
   while (from.intDigits.length < intWidth) from.intDigits.unshift(0)
   while (to.intDigits.length < intWidth) to.intDigits.unshift(0)
@@ -107,7 +133,17 @@ function buildDisplayTokens(
 
   return tokenizeBalance(skeleton).map((token) => {
     if (token.type === 'separator') {
-      return { type: 'separator', char: token.char, key: token.key }
+      // The decimal point is real when the value has a fraction; a thousands comma is real when the
+      // digit to its left is.
+      const isPoint = token.char === '.'
+      return {
+        type: 'separator',
+        char: token.char,
+        key: token.key,
+        digitIndex,
+        inFrom: isPoint ? fromLengths.frac > 0 : isRealColumn(digitIndex - 1, fromLengths),
+        inTo: isPoint ? toLengths.frac > 0 : isRealColumn(digitIndex - 1, toLengths),
+      }
     }
 
     const displayDigit: DisplayDigit = {
@@ -116,10 +152,37 @@ function buildDisplayTokens(
       digitIndex,
       fromDigit: fromDigits[digitIndex] ?? 0,
       toDigit: toDigits[digitIndex] ?? 0,
+      inFrom: isRealColumn(digitIndex, fromLengths),
+      inTo: isRealColumn(digitIndex, toLengths),
     }
     digitIndex += 1
     return displayDigit
   })
+}
+
+/**
+ * Fold styling for a column that is padding in the starting or target value. Columns that belong to
+ * both values get nothing, so the plain reveal and unaffected columns are untouched. A column leaving
+ * the row keeps rolling and finishes folding exactly as its own (staggered) roll lands; a column
+ * joining the row opens straight away.
+ */
+function paddingFold(
+  token: { digitIndex: number; inFrom: boolean; inTo: boolean },
+  animating: boolean,
+  rollDurationMs: number,
+  digitStaggerMs: number,
+): { className: string; style: CSSProperties } | null {
+  if (token.inFrom && token.inTo) return null
+  const present = animating ? token.inTo : token.inFrom
+  const leaving = animating && !present
+  const delayMs = Math.max(0, rollDurationMs - PADDING_FOLD_MS + token.digitIndex * digitStaggerMs)
+  return {
+    className: [styles.paddingFold, !present && styles.collapsed].filter(Boolean).join(' '),
+    style: {
+      transitionDuration: `${PADDING_FOLD_MS}ms`,
+      transitionDelay: leaving ? `${delayMs}ms` : undefined,
+    },
+  }
 }
 
 function digitEndOffset(fromDigit: number, toDigit: number): number {
@@ -153,6 +216,7 @@ function DigitColumn({
   visible,
   rollDurationMs,
   digitStaggerMs,
+  fold,
 }: {
   fromDigit: number
   toDigit: number
@@ -161,6 +225,7 @@ function DigitColumn({
   visible: boolean
   rollDurationMs: number
   digitStaggerMs: number
+  fold: ReturnType<typeof paddingFold>
 }) {
   const startOffset = fromDigit
   const endOffset = digitEndOffset(fromDigit, toDigit)
@@ -169,7 +234,10 @@ function DigitColumn({
 
   return (
     <span
-      className={[styles.digitColumn, visible ? styles.digitVisible : styles.digitHidden].join(' ')}
+      className={[styles.digitColumn, visible ? styles.digitVisible : styles.digitHidden, fold?.className]
+        .filter(Boolean)
+        .join(' ')}
+      style={fold?.style}
       aria-hidden
     >
       <span
@@ -260,8 +328,9 @@ export function RollingBalanceValue({
 
   return (
     <span className={rootClassName} aria-label={value}>
-      {tokens.map((token) =>
-        token.type === 'digit' ? (
+      {tokens.map((token) => {
+        const fold = paddingFold(token, animating, rollDurationMs, digitStaggerMs)
+        return token.type === 'digit' ? (
           <DigitColumn
             key={token.key}
             fromDigit={token.fromDigit}
@@ -271,17 +340,21 @@ export function RollingBalanceValue({
             visible={visible}
             rollDurationMs={rollDurationMs}
             digitStaggerMs={digitStaggerMs}
+            fold={fold}
           />
         ) : (
           <span
             key={token.key}
-            className={[styles.separator, visible && styles.separatorVisible].filter(Boolean).join(' ')}
+            className={[styles.separator, visible && styles.separatorVisible, fold?.className]
+              .filter(Boolean)
+              .join(' ')}
+            style={fold?.style}
             aria-hidden
           >
             {token.char}
           </span>
-        ),
-      )}
+        )
+      })}
     </span>
   )
 }
