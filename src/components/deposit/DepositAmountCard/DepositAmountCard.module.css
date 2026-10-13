@@ -307,11 +307,18 @@
   white-space: nowrap;
 }
 
+/* Rolling to the inactive 0 placeholder — the same dim colour as the static value it hands over to. */
+.amountRollInactive {
+  color: color-mix(in srgb, var(--semantic-color-text-primary) 30%, transparent);
+}
+
+/* Error state for the roll — matches `.amountDisplayError`; must follow `.amountRollInactive`. */
 .amountRollError {
   color: var(--semantic-color-status-error);
 }
 
-/* Hide the static value + caret during the roll so only the odometer shows. */
+/* Hide the input (and its caret) during the roll so only the odometer shows. The static value is
+   hidden by `.amountDisplayRolling`. */
 .amountValueHidden {
   visibility: hidden;
 }

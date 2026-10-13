@@ -275,7 +275,11 @@ export function DepositAmountCard({
             />
             {isAmountRolling && amountRoll ? (
               <span
-                className={[styles.amountRollLayer, hasError && styles.amountRollError]
+                className={[
+                  styles.amountRollLayer,
+                  !showActiveAmount && styles.amountRollInactive,
+                  hasError && styles.amountRollError,
+                ]
                   .filter(Boolean)
                   .join(' ')}
                 aria-hidden

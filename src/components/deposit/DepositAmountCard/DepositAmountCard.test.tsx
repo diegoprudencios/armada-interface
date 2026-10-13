@@ -203,6 +203,19 @@ describe('DepositAmountCard — roll lifetime and colour', () => {
       expect(layer?.className).toContain('amountRollError')
     })
   })
+
+  it('dims the odometer when it rolls to the inactive 0, matching the placeholder it hands over to', () => {
+    withMotionEnabled(() => {
+      // No spendable balance: every pill lands on 0, which the card shows as the dim placeholder.
+      const onAmountChange = vi.fn()
+      const props = { onAmountChange, maxInput: 0n, amountAriaLabel: 'Deposit amount' }
+      const { rerender, container } = render(<DepositAmountCard amount="5" {...props} />)
+      fireEvent.click(screen.getByRole('button', { name: '25%' }))
+      rerender(<DepositAmountCard amount="0" {...props} />)
+      const layer = container.querySelector('[class*="amountRollLayer"]')
+      expect(layer?.className).toContain('amountRollInactive')
+    })
+  })
 })
 
 describe('DepositAmountCard — fee caption', () => {
