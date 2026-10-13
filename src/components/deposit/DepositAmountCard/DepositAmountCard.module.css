@@ -222,10 +222,10 @@
 .amountField {
   position: relative;
   display: inline-block;
-  /* As wide as the digits, never wider than the card. A longer roll clips at the end. */
+  /* As wide as the digits, never wider than the card. An amount longer than the card runs past its
+     right edge rather than clipping, so every digit of the amount stays visible. */
   width: max-content;
   max-width: 100%;
-  overflow: hidden;
   vertical-align: top;
 }
 
