@@ -13,18 +13,23 @@ import {
   ResetWalletDialog,
 } from '@/components/settings'
 import { useShieldedWallet } from '@/hooks/useShieldedWallet'
+import { useNoteCounts } from '@/hooks/useNoteCounts'
+import { useMergeNotes } from '@/hooks/useMergeNotes'
+import { MERGE_SUGGEST_NOTE_COUNT, mergeTokenSymbol, type MergeToken } from '@/lib/shielded/merge-intent'
 import { openModalAtom } from '@/state/ui'
 import { preferencesAtom, type AutoLockMinutes } from '@/state/preferences'
 import {
   activeShieldedWalletIdAtom,
   autoLockDeadlineAtom,
+  shieldedUsdcSpendableAtom,
+  yieldSharesAtom,
 } from '@/state/wallet'
 import { historyRecoveryAtom, historyRecoveryTriggerAtom } from '@/state/history'
 import { clearHistoryCheckpoint } from '@/lib/shielded/history-checkpoint'
-import { getNetworkMode } from '@/config/network'
+import { cleanEnv, getNetworkMode } from '@/config/network'
 import styles from './SettingsModal.module.css'
 
-const APP_VERSION = import.meta.env.VITE_APP_VERSION as string | undefined
+const APP_VERSION = cleanEnv(import.meta.env.VITE_APP_VERSION as string | undefined)
 
 const AUTO_LOCK_OPTIONS: ReadonlyArray<AutoLockMinutes> = [5, 15, 30]
 
@@ -43,6 +48,15 @@ export function SettingsModal() {
 
   const walletUnlocked = state?.status === 'unlocked'
   const isScanning = recovery.state === 'scanning'
+
+  // Tokens spread across enough notes to block spends — each gets a "Merge" (note consolidation).
+  const usdcBalance = useAtomValue(shieldedUsdcSpendableAtom)
+  const sharesBalance = useAtomValue(yieldSharesAtom)
+  const noteCounts = useNoteCounts(isOpen && walletUnlocked, `${usdcBalance ?? ''}:${sharesBalance ?? ''}`)
+  const { openMerge } = useMergeNotes()
+  const fragmented = (['usdc', 'shares'] as const)
+    .map((token: MergeToken) => ({ token, notes: noteCounts?.[token] ?? 0 }))
+    .filter(({ notes }) => notes >= MERGE_SUGGEST_NOTE_COUNT)
 
   // Route the close through useFlowExit so the overlay fades + the panel sinks before unmounting.
   // The atom stays set (isOpen true) until the animation completes; reduced motion closes instantly.
@@ -125,6 +139,34 @@ export function SettingsModal() {
             </ul>
           </Card>
 
+          {fragmented.length > 0 ? (
+            <Card className={styles.section}>
+              <h3 className={styles.sectionTitle}>Notes</h3>
+              <ul className={styles.rows}>
+                {fragmented.map(({ token, notes }) => (
+                  <li key={token} className={styles.row}>
+                    <div className={styles.rowLabel}>
+                      {`${mergeTokenSymbol(token)} — ${notes} notes`}
+                      <div className={styles.rowSubLabel}>
+                        Spread across many small notes, larger withdrawals and vault actions can fail.
+                        Merging combines them into fewer notes for a small fee.
+                      </div>
+                    </div>
+                    <div className={styles.rowAction}>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        showIcon={false}
+                        label="Merge"
+                        onClick={() => openMerge({ token })}
+                      />
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </Card>
+          ) : null}
+
           <Card className={styles.section}>
             <h3 className={styles.sectionTitle}>Preferences</h3>
             <ul className={styles.rows}>
@@ -163,30 +205,6 @@ export function SettingsModal() {
                       checked={prefs.showTechnicalDetailsByDefault}
                       onChange={(e: ChangeEvent<HTMLInputElement>) =>
                         setPrefs({ ...prefs, showTechnicalDetailsByDefault: e.target.checked })
-                      }
-                    />
-                    <span className={styles.toggleTrack} aria-hidden="true">
-                      <span className={styles.toggleThumb} />
-                    </span>
-                  </label>
-                </div>
-              </li>
-              <li className={styles.row}>
-                <div className={styles.rowLabel}>
-                  Submit transactions from my wallet
-                  <div className={styles.rowSubLabel}>
-                    Pay gas in ETH and sign each transaction in your wallet, instead of having the
-                    relayer broadcast for you. Use this if the relayer is unreachable.
-                  </div>
-                </div>
-                <div className={styles.rowAction}>
-                  <label className={styles.toggle}>
-                    <input
-                      type="checkbox"
-                      aria-label="Submit transactions from my wallet"
-                      checked={prefs.submitFromWallet}
-                      onChange={(e: ChangeEvent<HTMLInputElement>) =>
-                        setPrefs({ ...prefs, submitFromWallet: e.target.checked })
                       }
                     />
                     <span className={styles.toggleTrack} aria-hidden="true">

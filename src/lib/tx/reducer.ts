@@ -2,7 +2,7 @@
 // ABOUTME: Hooks call these and write the result back to the txListAtom + IDB. Every transition increments updatedSeq (OCC; see storage.ts).
 
 import { lifecycleFor } from './lifecycles'
-import type { ArtifactsFor, StageFor, TxError, TxKind, TxRecord } from './types'
+import type { ArtifactsFor, MetaFor, StageFor, TxError, TxKind, TxRecord } from './types'
 
 /** Reach the next stage. Sets executionState to `completed` if at terminalSuccess, else `active`. */
 export function advance<K extends TxKind>(
@@ -152,6 +152,53 @@ export function markRecoveredComplete<K extends TxKind>(record: TxRecord<K>): Tx
 }
 
 /**
+ * A record upgraded to completed by history recovery (`markRecoveredComplete`) keeps its authored meta — except a
+ * vault withdrawal still holding its typed estimate (its redeemed gross was never read): it takes the chain-derived
+ * gross from the recovered record, so it stops showing a quote-time figure as final. Anything else is returned as-is.
+ */
+export function adoptRecoveredAmount(upgraded: TxRecord, recovered: TxRecord): TxRecord {
+  if (upgraded.kind !== 'yield-withdraw' || recovered.kind !== 'yield-withdraw') return upgraded
+  const meta = (upgraded as TxRecord<'yield-withdraw'>).meta
+  if (meta.amountIsEstimate !== true) return upgraded
+  return { ...upgraded, meta: { ...meta, amount: (recovered as TxRecord<'yield-withdraw'>).meta.amount, amountIsEstimate: false } } as TxRecord
+}
+
+/**
+ * Whether `recovered` — a cross-chain shield rebuilt from its hub mint — is the delivery the authored cross-chain shield
+ * `authored` is waiting on. The hub mint's CCTP message carries the shield request's marker (`encryptedBundle[0]`, fresh
+ * randomness per request — the same marker the handler's own delivery scan matches on), so this finds an authored record
+ * that never learned its hub mint hash: delivery still in flight, or polling timed out (#77).
+ */
+export function awaitsDelivery(authored: TxRecord, recovered: TxRecord): boolean {
+  if (authored.kind !== 'shield-xchain' || recovered.kind !== 'shield-xchain') return false
+  const marker = (authored as TxRecord<'shield-xchain'>).artifacts.shieldRequest?.encryptedBundle[0]
+  const body = (recovered as TxRecord<'shield-xchain'>).artifacts.hubMessageBody
+  if (marker === undefined || body === undefined) return false
+  return body.toLowerCase().includes(marker.slice(2).toLowerCase())
+}
+
+/**
+ * An authored cross-chain shield whose delivery recovery found (`awaitsDelivery`): the hub mint proves it landed, so it
+ * completes — carrying the hub mint hash, and the chain's actual figures (the true deposit, Circle's actual CCTP fee,
+ * the protocol + relayer fees) in place of its review-time estimates, as the handler's own reconcile would have written.
+ */
+export function adoptRecoveredDelivery(authored: TxRecord, recovered: TxRecord): TxRecord {
+  const upgraded = markRecoveredComplete(authored as TxRecord<'shield-xchain'>)
+  const actual = (recovered as TxRecord<'shield-xchain'>).meta
+  return {
+    ...upgraded,
+    artifacts: { ...upgraded.artifacts, destTxHash: recovered.artifacts.sourceTxHash },
+    meta: {
+      ...upgraded.meta,
+      amount: actual.amount,
+      ...(actual.cctpFee !== undefined ? { cctpFee: actual.cctpFee, cctpFeeIsEstimate: false } : {}),
+      ...(actual.protocolFee !== undefined ? { protocolFee: actual.protocolFee } : {}),
+      ...(actual.feeAmount !== undefined ? { feeAmount: actual.feeAmount } : {}),
+    },
+  } as TxRecord
+}
+
+/**
  * Cross-chain kinds: a record's `sourceTxHash` is only the burn/source leg; terminal success
  * additionally requires CCTP delivery (the mint) on the destination chain.
  */
@@ -185,6 +232,24 @@ export function patchArtifacts<K extends TxKind>(
     updatedSeq: record.updatedSeq + 1,
     updatedAt: Date.now(),
     artifacts: { ...record.artifacts, ...artifactPatch },
+  }
+}
+
+/**
+ * Merge on-chain-reconciled values into a record's `meta` (bumping `updatedSeq` for OCC). Meta is
+ * normally submit-time input, but a few values are only knowable post-execution — e.g. a cross-chain
+ * shield's actual CCTP `feeExecuted`, reconciled from the hub delivery on confirmation so the receipt
+ * matches the note that landed. Use only for such actual-value reconciliation, never to re-derive inputs.
+ */
+export function patchMeta<K extends TxKind>(
+  record: TxRecord<K>,
+  metaPatch: Partial<MetaFor<K>>,
+): TxRecord<K> {
+  return {
+    ...record,
+    updatedSeq: record.updatedSeq + 1,
+    updatedAt: Date.now(),
+    meta: { ...record.meta, ...metaPatch },
   }
 }
 

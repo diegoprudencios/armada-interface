@@ -60,19 +60,18 @@ const CCTP_FAST_FEE_BPS = 2n
  *
  * Migration table — flips a kind's USDC fee on as its handler migrates to `submitRelay`:
  *   - A3: unshield-local → reads `quote.fees.unshield`
- *   - A4: transfer-shielded / yield-deposit / yield-withdraw (still `0n` here until A4 ships)
+ *   - A4: transfer-shielded / yield-deposit / yield-withdraw → `transfer` / `crossContract`
  *   - A5: unshield-xchain hub burn — separate; today's CCTP fee path is unchanged
  *
- * `quote` is optional: pre-quote-load the modal renders `0n`, which is also the right answer
- * for kinds that don't consume the quote. Modals pass the live `useFees()` quote when they have
- * one.
+ * `quote` is optional: without one this returns `0n`, which is the right answer for kinds that don't consume the
+ * quote. For a relayer-paid kind a missing quote means the fee isn't known yet — its flow shows "—" and holds Confirm
+ * (`QUOTE_PENDING_REASON`, spec G-4), never a zero fee. Modals pass the live `useFees()` quote when they have one.
  */
 /**
  * Per-kind options that flip a fee-shape under the kind's umbrella. Today only `shield` uses
- * `gasless` — it's free under Phase A's user-wallet direct submit but carries a `shield` tier
- * fee under Phase B's permit + wrapper path. The flag lives in the modal (which knows whether
- * a wrapper is deployed for the chosen chain AND the user hasn't toggled wallet-override) and
- * is passed in here for every recompute.
+ * `gasless` — it's free under the user-wallet direct submit but carries a `shield` tier fee under
+ * the permit + wrapper path. The flag lives in the modal (which knows whether a wrapper is deployed
+ * for the chosen chain AND the relayer is reachable) and is passed in here for every recompute.
  */
 export interface UserFeeOpts {
   /** Phase B `shield` gasless path: include the relayer's `shield` tier fee. Default false. */
@@ -90,10 +89,10 @@ export function userFeeForKind(
 ): bigint {
   switch (kind) {
     case 'shield-xchain':
-      // Phase B4 — gasless path: the wrapper pulls `amount + fee` via permit on the client
-      // chain, burns `amount` through CCTP, transfers `fee` to the relayer. The relayer's
-      // `shieldXchain` fee is per-chain (Base Sepolia ≠ Ethereum Sepolia — see the relayer's
-      // FeeCalculator), so the modal MUST pass the quote for the SOURCE chain via
+      // Phase B4 — gasless path: the wrapper pulls `amount` (fee included) via permit on the
+      // client chain; the fee comes out of it — the user's note is `amount − fee`, the relayer's
+      // `fee`. The relayer's `shieldXchain` fee is per-chain (Base Sepolia ≠ Ethereum Sepolia —
+      // see the relayer's FeeCalculator), so the modal MUST pass the quote for the SOURCE chain via
       // `fetchFees(chainId)`. Direct path returns 0 — the user pays native gas themselves and
       // there's no broadcaster involved. The CCTP fast-fee (which still applies on the destination
       // mint) is surfaced as a separate `cctpFee` channel via `cctpFastFeeForAmount`, NOT shoved
@@ -113,6 +112,10 @@ export function userFeeForKind(
     case 'transfer-shielded':
       // A4 — relayer-mediated. The relayer's transfer-tier fee covers a single transact() call
       // (no cross-contract leg), so it's the cheapest tier in the schedule.
+      return quote ? BigInt(quote.fees.transfer) : 0n
+    case 'consolidate':
+      // A bare transact() self-spend, priced at the transfer tier PER PROOF — this is the per-proof
+      // fee; the planned total (one per proof) comes from the consolidation preview.
       return quote ? BigInt(quote.fees.transfer) : 0n
     case 'yield-deposit':
     case 'yield-withdraw':
@@ -173,6 +176,7 @@ export function feeModelForKind(kind: TxKind, opts?: UserFeeOpts): FeeModel {
     case 'transfer-shielded':
     case 'yield-deposit':
     case 'yield-withdraw':
+    case 'consolidate':
       // A4 — all relayer-mediated. Recipient receives the entered amount; the broadcaster fee
       // is an extra output in the proof, deducted on top of the entered amount.
       return 'fee-on-top'
@@ -274,6 +278,18 @@ export function cctpFastFeeForAmount(amount: bigint): bigint {
   return (amount * CCTP_FAST_FEE_BPS) / 10_000n
 }
 
+/** How many times the displayed CCTP fast-fee estimate a cross-chain tx binds as its on-chain `maxFee`. */
+const CCTP_MAX_FEE_MULTIPLIER = 2n
+
+/**
+ * The CCTP fee estimate a cross-chain tx showed at review, read back from the `maxFee` it bound on-chain
+ * (`cctpMaxFeeForKind`'s inverse). History recovery uses it for a cross-chain unshield, whose actual fee is
+ * only known on the destination chain, so the recovered receipt matches the authored one exactly.
+ */
+export function cctpFeeEstimateFromMaxFee(maxFee: bigint): bigint {
+  return maxFee / CCTP_MAX_FEE_MULTIPLIER
+}
+
 /**
  * 2× multiple over the CCTP fast-fee to use as CCTP V2's on-chain `maxFee` bound. The displayed
  * fee is a realistic estimate (matches the server's conservative bps buffer); the on-chain
@@ -284,7 +300,7 @@ export function cctpMaxFeeForKind(kind: TxKind, amount: bigint): bigint {
   switch (kind) {
     case 'shield-xchain':
     case 'unshield-xchain':
-      return cctpFastFeeForAmount(amount) * 2n
+      return cctpFastFeeForAmount(amount) * CCTP_MAX_FEE_MULTIPLIER
     default:
       return 0n
   }
@@ -481,7 +497,7 @@ export interface RelayerHealthResponse {
     pendingCount: number
   }>
   generatedAt: number
-  /** In-process counters (A6). May be empty / undefined when no events have occurred. */
+  /** In-process relayer counters. May be empty / undefined when no events have occurred. */
   counters?: Record<string, number>
 }
 
@@ -501,8 +517,16 @@ export async function fetchHealth(signal?: AbortSignal): Promise<RelayerHealthRe
 }
 
 /** Poll a previously-submitted relay tx's status. */
-export async function pollStatus(txHash: string, signal?: AbortSignal): Promise<StatusResponse> {
-  const res = await fetchWithTimeout(`${relayerEndpoint(RELAYER_ENDPOINTS.status)}/${txHash}`, {
+export async function pollStatus(
+  txHash: string,
+  signal?: AbortSignal,
+  chainId?: number,
+): Promise<StatusResponse> {
+  // Scope the lookup to the tx's chain. Omitting chainId makes the relayer fan out an
+  // eth_getTransactionReceipt across every configured chain sequentially (§9.1) — extra round-trips
+  // and worst-case latency when the tx is on the last chain checked. The caller always knows its chain.
+  const query = chainId !== undefined ? `?chainId=${chainId}` : ''
+  const res = await fetchWithTimeout(`${relayerEndpoint(RELAYER_ENDPOINTS.status)}/${txHash}${query}`, {
     method: 'GET',
     headers: { Accept: 'application/json' },
   }, signal, 15_000)

@@ -11,8 +11,10 @@ import { Button } from '@/design'
 import { useWallet } from '@/hooks/useWallet'
 import { useShieldedWallet } from '@/hooks/useShieldedWallet'
 import { useRelayerHealth } from '@/hooks/useRelayerHealth'
+import { useIndexerHealth } from '@/hooks/useIndexerHealth'
 import { loadDeployments, type ResolvedDeployments } from '@/config/deployments'
 import { getNetworkConfig, isLocalMode, isRelayerConfigured, type ChainIdentity } from '@/config/network'
+import { isIndexerConfigured } from '@/lib/indexer'
 import { shieldedUsdcAtom } from '@/state/wallet'
 import { formatUsdcAmount, truncateAddress } from '@/lib/format'
 import styles from './Debug.module.css'
@@ -76,7 +78,7 @@ function AddressRow({ label, value, truncate = false }: {
 
 const ERC20_BALANCE_ABI = ['function balanceOf(address) view returns (uint256)']
 
-/** Secondary manifest shape (hub-v3.json / client-v3.json / clientB-v3.json). */
+/** Secondary CCTP/faucet manifest shape (hub-v3.json / client1-v3.json / client2-v3.json). */
 interface FaucetManifest {
   chainId: number
   contracts: {
@@ -85,21 +87,33 @@ interface FaucetManifest {
   }
 }
 
-/** Manifest filename per role; mirrors the convention in deployments/ at the repo root. */
-const FAUCET_MANIFEST_NAMES: Record<'hub' | 'clientA' | 'clientB', string> = {
-  hub: 'hub-v3.json',
-  clientA: 'client-v3.json',
-  clientB: 'clientB-v3.json',
-}
+/** Safety cap on probed client faucet manifests (contiguous client1..N). */
+const MAX_FAUCET_MANIFESTS = 32
 
-async function loadFaucetManifest(role: 'hub' | 'clientA' | 'clientB'): Promise<FaucetManifest | null> {
-  try {
-    const res = await fetch(`/api/deployments/${FAUCET_MANIFEST_NAMES[role]}`)
-    if (!res.ok) return null
-    return (await res.json()) as FaucetManifest
-  } catch {
-    return null
+/**
+ * Discover the local faucet manifests (hub-v3.json + client<i>-v3.json), binding each by its EMBEDDED
+ * chainId rather than assuming an ordinal → chain mapping. Faucet contracts exist only on local Anvil
+ * so there's no network suffix. Returns a chainId → faucet-manifest map.
+ */
+async function loadFaucetManifests(): Promise<Record<number, FaucetManifest>> {
+  const tryLoad = async (name: string): Promise<FaucetManifest | null> => {
+    try {
+      const res = await fetch(`/api/deployments/${name}`)
+      if (!res.ok) return null
+      return (await res.json()) as FaucetManifest
+    } catch {
+      return null
+    }
   }
+  const out: Record<number, FaucetManifest> = {}
+  const hub = await tryLoad('hub-v3.json')
+  if (hub) out[hub.chainId] = hub
+  for (let i = 1; i <= MAX_FAUCET_MANIFESTS; i++) {
+    const m = await tryLoad(`client${i}-v3.json`)
+    if (!m) break // contiguous client1..N — first gap ends the list
+    out[m.chainId] = m
+  }
+  return out
 }
 
 interface ChainBalance {
@@ -172,6 +186,7 @@ export function Debug() {
   // hosted builds without VITE_RELAYER_URL set `isRelayerConfigured()` to false and would
   // otherwise hit `fetch('')` every 60s for no benefit.
   const relayerHealth = useRelayerHealth({ enabled: isRelayerConfigured() })
+  const indexerHealth = useIndexerHealth({ enabled: isIndexerConfigured() })
 
   // Refresh chain balances against the currently-connected EVM address. Called on mount,
   // after a successful faucet drip, and via the "Refresh" button.
@@ -200,20 +215,17 @@ export function Debug() {
 
   // One-time bootstrap: pull the privacy-pool deployments + (local mode only) the secondary
   // faucet manifests. The faucet manifests (hub-v3.json etc.) only exist for the local Anvil
-  // deployment; skipping the fetch on Sepolia avoids three 404s in the network panel.
+  // deployment; skipping the fetch on Sepolia avoids 404s in the network panel. Faucets are keyed by
+  // the chainId embedded in each manifest, so N clients need no per-count code.
   useEffect(() => {
     void (async () => {
       const resolved = await loadDeployments()
       setDeployments(resolved)
       if (!isLocalMode()) return
-      const [hubFaucet, clientFaucet, clientBFaucet] = await Promise.all([
-        loadFaucetManifest('hub'),
-        loadFaucetManifest('clientA'),
-        loadFaucetManifest('clientB'),
-      ])
+      const manifests = await loadFaucetManifests()
       const map: Record<number, string> = {}
-      for (const m of [hubFaucet, clientFaucet, clientBFaucet]) {
-        if (m?.contracts.faucet) map[m.chainId] = m.contracts.faucet
+      for (const m of Object.values(manifests)) {
+        if (m.contracts.faucet) map[m.chainId] = m.contracts.faucet
       }
       setFaucetByChainId(map)
     })()
@@ -233,13 +245,17 @@ export function Debug() {
       setDripError(null)
       setDrippingChainId(chainId)
       try {
+        // The dev endpoint drips against a local Anvil node; tell it which RPC to hit (from the
+        // registry) so it doesn't need its own chainId → RPC map.
+        const cfg = getNetworkConfig()
+        const rpcUrl = [cfg.hub, ...cfg.clients].find(c => c.chainId === chainId)?.rpcUrls[0]
         // POST to the dev-server endpoint — uses the Anvil deployer to call dripTo(address),
         // sending USDC + sponsor ETH to the user. Sidesteps the chicken-and-egg of needing
         // gas to call drip() directly. The endpoint is local-mode only (503 on sepolia).
         const res = await fetch('/api/fund-gas', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ address: evmAddress, chainId }),
+          body: JSON.stringify({ address: evmAddress, chainId, rpcUrl }),
         })
         if (!res.ok) {
           const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
@@ -271,6 +287,11 @@ export function Debug() {
           <dd>
             <code>{getNetworkConfig().relayerUrl || '—'}</code>
             {isRelayerConfigured() ? <RelayerHealthPill state={relayerHealth} /> : null}
+          </dd>
+          <dt>Indexer URL</dt>
+          <dd>
+            <code>{getNetworkConfig().indexerUrl ?? '— (RPC-only sync)'}</code>
+            {isIndexerConfigured() ? <IndexerHealthPill state={indexerHealth} /> : null}
           </dd>
         </dl>
       </Card>
@@ -410,6 +431,32 @@ function RelayerHealthPill({ state }: { state: ReturnType<typeof useRelayerHealt
 
   return (
     <span className={styles.healthPill} aria-label={`Relayer health: ${label}`}>
+      <span className={dotClass} aria-hidden />
+      {label}
+    </span>
+  )
+}
+
+// Indexer health pill — reachability only (the /health endpoint carries no status body). Green =
+// reachable, red = unreachable (query error), gray = in-flight first probe. Gated on
+// isIndexerConfigured() at the call site so it only renders when a watcher URL is set.
+function IndexerHealthPill({ state }: { state: ReturnType<typeof useIndexerHealth> }) {
+  const { error, isLoading, isReachable } = state
+
+  let dotClass = styles.healthDot
+  let label: string
+  if (error) {
+    dotClass = `${styles.healthDot} ${styles.healthDotUnreachable}`
+    label = 'unreachable'
+  } else if (isLoading || !isReachable) {
+    label = 'checking…'
+  } else {
+    dotClass = `${styles.healthDot} ${styles.healthDotHealthy}`
+    label = 'reachable'
+  }
+
+  return (
+    <span className={styles.healthPill} aria-label={`Indexer health: ${label}`}>
       <span className={dotClass} aria-hidden />
       {label}
     </span>

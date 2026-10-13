@@ -15,15 +15,17 @@ import { RecentActivityList, ActivityAllPanel } from '@/components/dashboard/Rec
 import { useDepositTooltipHandoff, useEarnBannerHandoff } from '@/hooks/useEarnBannerHandoff'
 import { ActivityReceipt } from '@/components/dashboard/ActivityReceipt'
 import { buildActivityItems, type DashboardActivityItem } from '@/components/dashboard/txActivityAdapter'
+import { selfSendAsMerge } from '@/lib/tx/selfSend'
 import { formatUsdcAmount } from '@/components/dashboard/dashboardFormat'
 import type { BalanceRollMode } from '@/components/dashboard/RollingBalanceValue'
 import { SyncGate, isInitialSyncGated } from '@/components/sync'
-import { usePrivateUsdcDisplay } from '@/hooks/usePrivateUsdcDisplay'
 import { useYieldRate } from '@/hooks/useYieldRate'
 import { useOpenActionModal } from '@/hooks/useOpenActionModal'
 import { sharesToUsdc } from '@/lib/yield'
+import { accruedVaultYieldRaw } from '@/components/dashboard/vaultEarnings'
+import { historyRecoveryAtom } from '@/state/history'
 import { openModalAtom, balanceHiddenAtom } from '@/state/ui'
-import { shieldedUsdcAtom, syncStateAtom, yieldSharesAtom, shieldedWalletAtom, evmAddressAtom } from '@/state/wallet'
+import { shieldedUsdcAtom, yieldSharesAtom, shieldedWalletAtom, evmAddressAtom } from '@/state/wallet'
 import { activeTxListAtom } from '@/state/tx'
 import { requestLinksAtom, requestShareIntentAtom } from '@/state/requestLinks'
 import styles from './Dashboard.module.css'
@@ -41,12 +43,16 @@ const ACTIVITY_PANEL_MAX = 500
 export function Dashboard() {
   // Data (all hooks run unconditionally, before the sync gate's early return).
   const shielded = useAtomValue(shieldedUsdcAtom)
-  const sync = useAtomValue(syncStateAtom)
-  const { displayBalance } = usePrivateUsdcDisplay()
   const yieldShares = useAtomValue(yieldSharesAtom)
   const { rate: yieldRate } = useYieldRate()
   const shieldedWallet = useAtomValue(shieldedWalletAtom)
   const txList = useAtomValue(activeTxListAtom)
+  // The records as Activity shows them — a send to the wallet's own 0zk reads as a merge (only its fee left); the row
+  // and its receipt both read this list, so they agree.
+  const activityTxList = useMemo(
+    () => txList.map((record) => selfSendAsMerge(record, shieldedWallet.shieldedAddress)),
+    [txList, shieldedWallet.shieldedAddress],
+  )
   const requestLinks = useAtomValue(requestLinksAtom)
   const evmAddress = useAtomValue(evmAddressAtom)
 
@@ -82,7 +88,7 @@ export function Dashboard() {
   // trigger — so the card holds the OLD number and rolls to the NEW one on return, rather than
   // flashing NEW then rolling. Mirrors the mockup, which defers the whole advance (value + roll)
   // until the user is back on the dashboard.
-  const gated = isInitialSyncGated(shielded, sync.status)
+  const gated = isInitialSyncGated(shielded)
   // The vault position depends on yieldRate, which loads from a separate poll (useYieldRate) — later
   // than the wallet scan the sync gate waits on. Only prime the promo-banner handoffs once BOTH the
   // gate has lifted and the vault data has loaded, so the established balance/vault values form the
@@ -97,11 +103,22 @@ export function Dashboard() {
     const id = requestAnimationFrame(() => setHandoffReady(true))
     return () => cancelAnimationFrame(id)
   }, [gated, vaultLoaded])
-  const liveBalance = usdcToNumber(displayBalance)
+  // The SDK balance only — the dashboard is gated until it's known (G-11), so the 0 is never shown.
+  const liveBalance = usdcToNumber(shielded ?? 0n)
   const earningUsdc =
     yieldShares !== null && yieldRate !== null ? sharesToUsdc(yieldShares, yieldRate.rate) : 0n
   const liveVault = usdcToNumber(earningUsdc)
   const vaultApy = yieldRate !== null ? Number(yieldRate.apyBps) / 100 : undefined
+  // Accrued vault yield = current vault value − net capital contributed (settled yield deposits −
+  // withdrawals, from history). Only trustworthy once the vault has loaded, the initial sync gate has
+  // lifted, and history recovery has SETTLED (`idle`) — a mid/failed recovery scan would under-count
+  // deposits and over-state the gain. Until then leave it undefined so the bar shows its placeholder
+  // rather than a wrong-looking number.
+  const historyRecovery = useAtomValue(historyRecoveryAtom)
+  const vaultEarned =
+    vaultLoaded && !gated && historyRecovery.state === 'idle'
+      ? usdcToNumber(accruedVaultYieldRaw(txList, earningUsdc))
+      : undefined
   // Both the private balance and the vault position are held while a tx modal is open (or the sync
   // gate is up), then advance together with a single roll trigger on return — so the balance roll,
   // the vault-row grow-in, and the earn-banner handoff all play on the dashboard rather than behind
@@ -145,8 +162,8 @@ export function Dashboard() {
   // Full activity list (uncapped) so the panel can show everything up to its ceiling and we can tell
   // whether that ceiling was hit. The dashboard preview + the panel then slice their own views.
   const allActivityItems = useMemo(
-    () => buildActivityItems(txList, requestLinks, evmAddress, Infinity),
-    [txList, requestLinks, evmAddress],
+    () => buildActivityItems(activityTxList, requestLinks, evmAddress, Infinity),
+    [activityTxList, requestLinks, evmAddress],
   )
   const previewActivityItems = useMemo(
     () => allActivityItems.slice(0, ACTIVITY_PREVIEW_MAX),
@@ -231,6 +248,7 @@ export function Dashboard() {
           vaultBalance={displayedVault}
           vaultRollFromValue={vaultRollFromValue}
           vaultApy={vaultApy}
+          vaultEarned={vaultEarned}
           armadaAddress={shieldedWallet.shieldedAddress}
           balanceHidden={balanceHidden}
           onBalanceHiddenChange={setBalanceHidden}
@@ -300,7 +318,7 @@ export function Dashboard() {
         onItemClick={handleActivityItemClick}
       />
       <ActivityReceipt
-        record={txList.find((record) => record.id === receiptId) ?? null}
+        record={activityTxList.find((record) => record.id === receiptId) ?? null}
         ownWalletAddress={evmAddress ?? undefined}
         open={receiptId !== null}
         onClose={() => setReceiptId(null)}

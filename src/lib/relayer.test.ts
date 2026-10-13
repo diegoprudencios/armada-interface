@@ -7,9 +7,11 @@ import {
   userFeeForKind,
   cctpFastFeeForAmount,
   cctpMaxFeeForKind,
+  cctpFeeEstimateFromMaxFee,
   computeFeeBreakdown,
   feeModelForKind,
   submitRelay,
+  pollStatus,
   fetchFees,
   fetchCctpDeliveryStatus,
   RelayerError,
@@ -219,6 +221,14 @@ describe('cctpFastFeeForAmount', () => {
   })
 })
 
+describe('cctpFeeEstimateFromMaxFee', () => {
+  it('recovers the estimate a cross-chain tx bound as its CCTP maxFee', () => {
+    for (const amount of [1_000_000n, 3_333_333n, 490_000n]) {
+      expect(cctpFeeEstimateFromMaxFee(cctpMaxFeeForKind('unshield-xchain', amount))).toBe(cctpFastFeeForAmount(amount))
+    }
+  })
+})
+
 describe('feeModelForKind', () => {
   it('classifies shield-xchain as fee-from-recipient (CCTP destination eats the only fee)', () => {
     // WHY: shield-xchain is still direct-submitted (Phase B's gasless shield path). The only
@@ -333,10 +343,17 @@ describe('computeFeeBreakdown', () => {
     // their shielded balance. A regression that ignored `secondaryFee` would over-quote the
     // recipient's mint, a regression that double-counted it would under-quote.
     const cctpFee = 10_000n // 0.01 USDC raw
-    const r = computeFeeBreakdown('unshield-xchain', AMOUNT, FEE, MAX, { secondaryFee: cctpFee })
-    expect(r.recipientReceives).toBe(AMOUNT - cctpFee)
+    const protocolFee = 3_000n // 0.003 USDC raw (nonzero unshield fee — 0 on demo3, >0 on mainnet)
+    const r = computeFeeBreakdown('unshield-xchain', AMOUNT, FEE, MAX, { secondaryFee: cctpFee, protocolFee })
+    // recipient absorbs BOTH the CCTP fee and the protocol fee; the user's debit is amount + broadcaster.
+    expect(r.recipientReceives).toBe(AMOUNT - cctpFee - protocolFee)
     expect(r.totalDeducted).toBe(AMOUNT + FEE)
     expect(r.inputMax).toBe(MAX - FEE)
+    // The user-facing "fees" line (paired with "total deducted") MUST equal totalDeducted - amount =
+    // the broadcaster fee ALONE. The CCTP + protocol fees are recipient-side, so folding them into
+    // this line double-counts them (fees ≠ total − amount). useUnshieldFlow derives feeInclusive this
+    // way; guard the relationship here.
+    expect(r.totalDeducted - AMOUNT).toBe(FEE)
   })
 
   it('fee-on-top-and-from-recipient floors recipientReceives at 0n when CCTP fee exceeds amount', () => {
@@ -690,5 +707,38 @@ describe('fetchFees — relayer wire-field normalization', () => {
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(wireBody('somethingElse')), { status: 200 }))
     const schedule = await fetchFees()
     expect(schedule.broadcasterShieldedAddress).toBe('')
+  })
+})
+
+describe('pollStatus', () => {
+  const fetchMock = vi.fn()
+  const ORIGINAL_FETCH = globalThis.fetch
+  const HASH = '0xdeadbeef0000000000000000000000000000000000000000000000000000beef'
+
+  beforeEach(() => {
+    fetchMock.mockReset()
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ status: 'confirmed' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+  })
+
+  afterAll(() => {
+    globalThis.fetch = ORIGINAL_FETCH
+  })
+
+  it('appends ?chainId= so the relayer scopes the receipt lookup to one chain (no cross-chain fan-out)', async () => {
+    await pollStatus(HASH, undefined, 11155111)
+    const [url] = fetchMock.mock.calls[0] as [string]
+    expect(url).toBe(`${relayerEndpoint(RELAYER_ENDPOINTS.status)}/${HASH}?chainId=11155111`)
+  })
+
+  it('omits the query when no chainId is given (back-compat: relayer falls back to fan-out)', async () => {
+    await pollStatus(HASH)
+    const [url] = fetchMock.mock.calls[0] as [string]
+    expect(url).toBe(`${relayerEndpoint(RELAYER_ENDPOINTS.status)}/${HASH}`)
   })
 })

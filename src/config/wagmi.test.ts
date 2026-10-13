@@ -4,16 +4,18 @@ import { describe, it, expect, vi } from 'vitest'
 
 // Stub getDefaultConfig so importing wagmi.ts doesn't spin up WalletConnect/RainbowKit on load.
 vi.mock('@rainbow-me/rainbowkit', () => ({ getDefaultConfig: () => ({}) }))
-// Pin network config so the module-load `getNetworkConfig()` is deterministic + side-effect-free.
+// Pin the chain identities so module-load `resolveChainsForMode()` is deterministic + side-effect-free.
+// A 3-client set (all local/synthesized) exercises the N-client derivation.
 vi.mock('./network', () => ({
-  isLocalMode: () => true,
-  getNetworkConfig: () => ({
-    hub: { chainId: 31337, name: 'Hub', rpcUrls: ['http://primary', 'http://fallback'] },
-    clients: [{ chainId: 31338, name: 'Client A', rpcUrls: ['http://only'] }],
-  }),
+  getAllChainIdentities: () => [
+    { chainId: 31337, domain: 100, name: 'Hub', rpcUrls: ['http://primary', 'http://fallback'] },
+    { chainId: 31338, domain: 101, name: 'Client A', rpcUrls: ['http://a'] },
+    { chainId: 31339, domain: 102, name: 'Client B', rpcUrls: ['http://b'] },
+    { chainId: 31340, domain: 103, name: 'Client C', rpcUrls: ['http://c'] },
+  ],
 }))
 
-import { buildTransports } from './wagmi'
+import { buildTransports, resolveChainsForMode } from './wagmi'
 import type { Chain } from 'wagmi/chains'
 
 const HUB = { id: 31337, name: 'Hub' } as unknown as Chain
@@ -28,7 +30,7 @@ describe('buildTransports (P1-18)', () => {
   it('uses a fallback transport for a chain with multiple configured RPC URLs', () => {
     const transports = buildTransports(
       [HUB],
-      [{ chainId: 31337, name: 'Hub', rpcUrls: ['http://primary', 'http://fallback'] }],
+      [{ chainId: 31337, name: 'Hub', domain: 100, rpcUrls: ['http://primary', 'http://fallback'] }],
     )
     expect(transportType(transports[31337]!)).toBe('fallback')
   })
@@ -36,16 +38,30 @@ describe('buildTransports (P1-18)', () => {
   it('uses a plain http transport for a chain with a single configured RPC URL', () => {
     const transports = buildTransports(
       [CLIENT],
-      [{ chainId: 31338, name: 'Client A', rpcUrls: ['http://only'] }],
+      [{ chainId: 31338, name: 'Client A', domain: 101, rpcUrls: ['http://only'] }],
     )
     expect(transportType(transports[31338]!)).toBe('http')
   })
 
   it('builds exactly one transport per chain', () => {
     const transports = buildTransports([HUB, CLIENT], [
-      { chainId: 31337, name: 'Hub', rpcUrls: ['http://primary', 'http://fallback'] },
-      { chainId: 31338, name: 'Client A', rpcUrls: ['http://only'] },
+      { chainId: 31337, name: 'Hub', domain: 100, rpcUrls: ['http://primary', 'http://fallback'] },
+      { chainId: 31338, name: 'Client A', domain: 101, rpcUrls: ['http://only'] },
     ])
     expect(Object.keys(transports).sort()).toEqual(['31337', '31338'])
+  })
+})
+
+describe('resolveChainsForMode — derives chains from the network config (N clients)', () => {
+  it('registers one wagmi chain per identity (hub + N clients), in order', () => {
+    const chains = resolveChainsForMode()
+    // 4 identities (hub + 3 clients) → 4 chains, no hardcoded count.
+    expect(chains.map(c => c.id)).toEqual([31337, 31338, 31339, 31340])
+  })
+
+  it('carries the identity name + RPC into each synthesized chain', () => {
+    const clientC = resolveChainsForMode().find(c => c.id === 31340)!
+    expect(clientC.name).toBe('Client C')
+    expect(clientC.rpcUrls.default.http).toEqual(['http://c'])
   })
 })

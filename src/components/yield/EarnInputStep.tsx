@@ -42,19 +42,23 @@ export interface EarnInputStepProps {
   displayFees: DisplayFees
   flowBreakdown?: FlowFeeBreakdown
   feeLoading?: boolean
+  /** The deposit's fee is still being planned: the caption says "Estimating fees…" instead of a figure. */
+  feeResolving?: boolean
+  /** The deposit can't be planned at this amount: the caption shows the fee as "—". */
+  feeUnavailable?: boolean
   gasChainId: number
   /**
-   * When true, the relayer pays gas — suppresses the GasBalanceNotice. `yield-deposit` defaults
-   * to the relayer path; `yield-withdraw` force-routes through the user's wallet (the
-   * multi-Transaction shape of `redeemAndShield` doesn't fit the broadcaster path today — see
-   * EarnModal). Modal passes the inverse of `effectiveUseWalletOverride`.
+   * When true, the relayer pays gas — suppresses the GasBalanceNotice. Both `yield-deposit` and
+   * `yield-withdraw` are relayer-submitted (#312's contract-side fee-from-proceeds made the relayer
+   * path viable for withdraw too — see EarnModal), so the modal always passes true.
    */
   gaslessMode?: boolean
   rate: YieldRate | null
   /**
-   * Optional pre-flight gate reason — set on the Withdraw tab when the user's private USDC
-   * doesn't cover the broadcaster fee. Surfaced inline + disables Review so the user sees the
-   * problem before paying for a 20–30s proof that would inevitably revert.
+   * Optional pre-flight gate reason — set on the Withdraw tab when the withdrawal amount doesn't
+   * exceed its own fee (the fee is skimmed from the redeemed proceeds, so a withdrawal below its fee
+   * can't cover it). Surfaced inline + disables Review so the user sees the problem before paying for
+   * a 20–30s proof that would inevitably revert.
    */
   continueBlockedReason?: string | null
   onCancel: () => void
@@ -95,6 +99,8 @@ export function EarnInputStepContent({
   displayFees,
   flowBreakdown,
   feeLoading = false,
+  feeResolving = false,
+  feeUnavailable = false,
   gasChainId,
   gaslessMode = true,
   rate,
@@ -114,6 +120,8 @@ export function EarnInputStepContent({
   | 'displayFees'
   | 'flowBreakdown'
   | 'feeLoading'
+  | 'feeResolving'
+  | 'feeUnavailable'
   | 'gasChainId'
   | 'gaslessMode'
   | 'rate'
@@ -123,9 +131,9 @@ export function EarnInputStepContent({
   | 'onShakeAnimationEnd'
 >) {
   const gasWarning = useGasBalanceWarning(gasChainId)
-  // Only surface the gas notice when the user actually pays gas themselves. `yield-deposit`
-  // defaults to relayer-mediated; `yield-withdraw` is force-routed through the wallet today,
-  // so the parent passes `gaslessMode={false}` on that tab and the notice DOES show.
+  // Only surface the gas notice when the user actually pays gas themselves. Both yield ops are relayer-mediated
+  // (no wallet-submit fallback — #23), so the parent passes `gaslessMode={true}` on both tabs and the notice
+  // doesn't show.
   const showGasNotice = !gaslessMode && gasWarning.show
   const { value: amount, error: parseError } = parseUsdcInput(amountStr)
   const tooMuch = amount > maxInput
@@ -178,6 +186,8 @@ export function EarnInputStepContent({
         displayFees={displayFees}
         flowBreakdown={flowBreakdown}
         feeLoading={feeLoading}
+        feeResolving={feeResolving}
+        feeUnavailable={feeUnavailable}
         // maxInput drives the 25% / 50% / 75% / Max percent pills; onMax keeps the exact fee-aware cap.
         maxInput={maxInput}
         balanceRaw={max}

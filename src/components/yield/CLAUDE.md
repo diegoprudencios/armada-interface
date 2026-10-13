@@ -22,10 +22,10 @@ Both kinds are submitted via the relayer — no wallet pop.
 
 ## Amount semantics
 
-- **Add Funds**: user enters USDC, modal submits `MetaYieldDeposit { amount }`. Max = `shieldedUsdcAtom`.
-- **Withdraw**: user enters USDC, modal converts to shares via `shares = amount × 1e18 / rate` for `MetaYieldWithdraw { amount, shares }`. Max = `yieldShares × rate / 1e18` (computed via `sharesToUsdc`).
+- **Add Funds**: user enters USDC, modal submits `MetaYieldDeposit { amount }`. Max = the SDK's unshield max (`useSpendCheck().maxInput` → `wallet.maxUnshieldAmount`: one proof, one tree, one fee), falling back to the spendable USDC less one fee until it's known.
+- **Withdraw**: user enters USDC, modal converts to shares via `shares = amount × 1e18 / rate` for `MetaYieldWithdraw { amount, shares }`. Max = every share one proof can redeem (`useSpendCheck().maxInput` in shares → `wallet.maxUnshieldAmount` for the share token: spendable shares only, one tree) at the current rate via `sharesToUsdc`, falling back to the vault position until it's known; a Max withdrawal submits exactly those shares rather than converting back (which would leave a dust note).
 
-The conversion path means the displayed "amount" is the **expected USDC output**, not raw shares. If the rate moves between quote and execution, the user receives slightly more or less than displayed. The lifecycle handler will need to reconcile; today the rate source is stubbed.
+The conversion path means the displayed "amount" is the **expected USDC output**, not raw shares. If the rate moves between quote and execution, the user receives slightly more or less than displayed (and slightly less even at a constant rate — the share count is floored), so Review marks it "≈". The withdraw handler reconciles `meta.amount` to the actual redeemed gross (`features/yield-withdraw/redeemedGross.ts`), which Confirm and the Activity receipt show. See `specs/TX_VALUES.md` (YD-10…YD-16).
 
 ## APY display
 
@@ -37,10 +37,12 @@ The conversion path means the displayed "amount" is the **expected USDC output**
 
 ## What's wired now
 
-- Executor handlers for `yield-deposit` and `yield-withdraw` are registered. Submit walks `build-proof` → `submit-relayer` → `hub-confirmed` via the adapter's atomic lend/redeem entry point (`buildYieldAdaptSdk` in `lib/shielded/yield-sdk.ts`, built on `@armada/sdk`).
+- Executor handlers for `yield-deposit` and `yield-withdraw` are registered. Submit walks `build-proof` → `submit-relayer` → `hub-pending` → `hub-confirmed` via the adapter's atomic lend/redeem entry point (`buildYieldAdaptSdk` in `lib/shielded/yield-sdk.ts`, built on `@armada/sdk`). `submit-relayer` broadcasts; after broadcast the record advances to `hub-pending` for the on-chain confirmation wait (the "Adding to shielded vault" / "Withdrawing" step), then terminal `hub-confirmed`. `hub-pending` is a resume/retry entry — idempotent via `sourceTxHash`.
 - `useYieldRate()` polls `vault.convertToAssets(1e18)` + net APY (`spoke.annualYieldBps × (10_000 - vault.yieldFeeBps) / 10_000`) on the hub every 5 min (visibility-gated). EarnModal calls `refresh()` on open + post-submit so the user always sees fresh state at the moments that matter.
 - Withdraw slippage: the modal refreshes the rate immediately before computing shares to bound the slippage window to ~1 block. A `minUsdcOut` proof-bound parameter on the adapter would close the residual window — tracked in the polish doc.
 - `useShieldedBalanceSync` writes both `shieldedUsdcAtom` and `yieldSharesAtom` so the user's shielded ayUSDC balance is visible.
+- A vault **deposit** is planned (`useSpendCheck`, amount + review steps), so the fee shown is the one its plan charges — the SDK can fold small change into it — with "Estimating fees…" / "—" until it's known; Confirm re-prices it at the fresh quote and the record stores total + per-proof fee. (A vault **withdrawal** keeps the quoted fee: it's taken contract-side from the proceeds, so its plan has no fee note — its fee breakdown shows the net received and no "Total deducted".) Review renders the draft record it will submit through `lib/fees/txFigures`; the confirmation screen and the Activity receipt read the stored record — including the APY frozen on it at submit, not the live rate — and mark a withdrawal's amount "≈" until its redeemed gross is read (`amountIsEstimate`).
+- A spend the wallet's notes are too fragmented for offers **"Merge notes"** — at review (from `useSpendCheck`: notice + disabled Confirm) and, as a fallback, on the error step (error `remedy: 'merge-notes'`) — opening the `merge` modal (`components/consolidate/`) with that spend as the one to unblock.
 
 ## Still stubbed
 

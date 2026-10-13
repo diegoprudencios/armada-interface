@@ -2,13 +2,22 @@
 // ABOUTME: Used for amount-card tooltips, review summaries, and max-fill.
 
 import type { FeeSchedule } from '@/lib/relayer'
-import { userFeeForKind } from '@/lib/relayer'
 import type { TxKind } from '@/lib/tx/types'
 
 export interface NativeGasEstimate {
   wei: bigint
   symbol: string
   formatted: string
+}
+
+/**
+ * The native-gas estimate as a compact approximate amount, e.g. "~0.0012 ETH" — trimmed to 4
+ * decimals. Shared by the amount-card fee caption and the breakdown tooltip so the two never
+ * disagree on the figure. The `~` conveys "estimate" (gas units × current price, not a quote).
+ */
+export function formatNativeGasAmount(gas: NativeGasEstimate): string {
+  const trimmed = gas.formatted.replace(/(\.\d{4})\d+$/, '$1')
+  return `~${trimmed} ${gas.symbol}`
 }
 
 export interface DisplayFees {
@@ -39,6 +48,7 @@ export function relayerFeeKeyForKind(kind: TxKind): RelayerFeeKey {
     case 'unshield-local':
       return 'unshield'
     case 'transfer-shielded':
+    case 'consolidate':
       return 'transfer'
     case 'transfer-shielded-received':
       // Synthetic received-transfer records are reconstructed from chain and never submitted, so
@@ -48,18 +58,95 @@ export function relayerFeeKeyForKind(kind: TxKind): RelayerFeeKey {
   }
 }
 
+/** The zero address — a shield that routes no fee to an integrator. */
+const NO_INTEGRATOR = '0x0000000000000000000000000000000000000000'
+
+/**
+ * The integrator a shield's protocol fee must be read with: the one the shield will carry, since the fee module prices
+ * by it (a registered integrator changes the take). Only a direct same-chain shield carries the configured integrator;
+ * a gasless shield and both cross-chain paths carry none (address(0)) — see the shield handlers.
+ */
+export function shieldFeeIntegrator(kind: TxKind, gasless: boolean, configuredIntegrator: string): string {
+  return kind === 'shield' && !gasless ? configuredIntegrator : NO_INTEGRATOR
+}
+
+/** How sure a shield's displayed protocol fee is. */
+export type ShieldProtocolFeeStatus = 'exact' | 'pending' | 'estimate'
+
+/**
+ * The protocol shield fee to show for `feeBase`, and how sure it is (spec G-4, G-5):
+ *  - `exact` — the fee module's on-chain `calculateShieldFee` for the base on screen;
+ *  - `pending` — that read hasn't landed for this base (or the fee module address is still loading): there's no fee to
+ *    show yet, never a placeholder;
+ *  - `estimate` — the fee module can't be read: the ~50 bps take (`baseArmadaTakeBps`), marked as an estimate — never 0.
+ */
+export function resolveShieldProtocolFee(args: {
+  feeBase: bigint
+  onChain: bigint | undefined
+  onChainMatchesLive: boolean
+  feeModule: 'available' | 'loading' | 'unavailable'
+}): { protocolFee: bigint; status: ShieldProtocolFeeStatus } {
+  const estimate = (args.feeBase * 50n) / 10_000n
+  if (args.feeModule === 'unavailable') return { protocolFee: estimate, status: 'estimate' }
+  if (args.feeModule === 'available' && args.onChain !== undefined && args.onChainMatchesLive) {
+    return { protocolFee: args.onChain, status: 'exact' }
+  }
+  return { protocolFee: estimate, status: 'pending' }
+}
+
 /** Relayer USDC reimbursement — not charged to users until submitRelay ships. */
 export function relayerGasFeeForKind(_kind: TxKind, _quote: FeeSchedule | null): bigint {
   return 0n
 }
 
-/** Base display fees; shield protocol fee is overridden in useDisplayFees via fee module. */
-export function computeDisplayFees(
+/**
+ * The base the protocol shield fee (PrivacyPool's ~50 bps take) is charged on. The pool shields only
+ * the amount that reaches it after upstream carve-outs, so estimating the fee on the full deposit
+ * over-states it (double-counting the fee on the carved-out portions) and under-reports what the user
+ * receives:
+ *  - same-chain gasless shield: the relayer fee is carved out first as its own note → base `amount - relayerFee`.
+ *  - shield-xchain: the CCTP mint deducts its fee first, then (gasless) the relayer fee → base
+ *    `amount - relayerFee - cctpFee`.
+ * Direct same-chain shield (no carve-out) uses the full `amount`.
+ */
+export function shieldProtocolFeeBase(
   kind: TxKind,
   amount: bigint,
+  relayerFee: bigint,
+  gasless: boolean,
+  cctpFee: bigint = 0n,
+): bigint {
+  if (kind === 'shield' && gasless) return amount > relayerFee ? amount - relayerFee : amount
+  if (kind === 'shield-xchain') {
+    const carved = relayerFee + cctpFee
+    return amount > carved ? amount - carved : amount
+  }
+  return amount
+}
+
+/**
+ * Whether a yield withdrawal is too small to cover its own fee (→ block submit). The withdraw fee is
+ * skimmed from the redeemed proceeds (contract-side re-shield to the relayer — see yield-sdk
+ * `redeemAndShield`), NOT from the user's pre-existing private USDC, so the only uncoverable case is a
+ * withdrawal whose amount doesn't exceed the fee: the redeem can't pay a fee larger than its proceeds
+ * (it would revert) and a net-zero withdrawal is pointless. `feeTotal === 0` (no fee) is never
+ * blocked.
+ */
+export function withdrawBelowFee(amount: bigint, feeTotal: bigint): boolean {
+  return feeTotal > 0n && amount <= feeTotal
+}
+
+/**
+ * Base display fees; shield protocol fee is overridden in useDisplayFees via fee module. The only protocol fee is the
+ * pool's shield fee, which is an on-chain read — so the base is 0 for every kind: Armada's pool charges no unshield
+ * fee (`TransactModule`: "unshield is free per spec"), and no other kind has one. (Relayer fees are not protocol fees.)
+ */
+export function computeDisplayFees(
+  kind: TxKind,
+  _amount: bigint,
   _quote: FeeSchedule | null,
 ): DisplayFees {
-  const protocolFee = userFeeForKind(kind, amount)
+  const protocolFee = 0n
   const feeInclusive =
     kind === 'shield' || kind === 'shield-xchain' || kind === 'unshield-xchain'
   return {

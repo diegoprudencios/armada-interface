@@ -17,6 +17,7 @@ const COPY: Record<TxKind, Partial<Record<string, CopyEntry>>> = {
   shield: {
     'build-proof': 'Preparing transaction',
     'submit-relayer': { waiting: 'Confirm in your wallet', active: 'Submitting transaction' },
+    'hub-pending': 'Shielding',
     'hub-confirmed': 'Shielded',
   },
   'shield-xchain': {
@@ -31,6 +32,7 @@ const COPY: Record<TxKind, Partial<Record<string, CopyEntry>>> = {
   'unshield-local': {
     'build-proof': 'Preparing transaction',
     'submit-relayer': 'Submitting privately',
+    'hub-pending': 'Unshielding',
     'hub-confirmed': 'Unshielded',
   },
   'unshield-xchain': {
@@ -45,6 +47,7 @@ const COPY: Record<TxKind, Partial<Record<string, CopyEntry>>> = {
   'transfer-shielded': {
     'build-proof': 'Preparing transaction',
     'submit-relayer': 'Submitting privately',
+    'hub-pending': 'Sending',
     'hub-confirmed': 'Sent',
   },
   'transfer-shielded-received': {
@@ -53,12 +56,20 @@ const COPY: Record<TxKind, Partial<Record<string, CopyEntry>>> = {
   'yield-deposit': {
     'build-proof': 'Preparing transaction',
     'submit-relayer': 'Submitting privately',
+    'hub-pending': 'Adding to shielded vault',
     'hub-confirmed': 'Earning',
   },
   'yield-withdraw': {
     'build-proof': 'Preparing transaction',
     'submit-relayer': 'Submitting privately',
+    'hub-pending': 'Withdrawing',
     'hub-confirmed': 'Returned to balance',
+  },
+  consolidate: {
+    'build-proof': 'Preparing transaction',
+    'submit-relayer': 'Submitting privately',
+    'hub-pending': 'Merging notes',
+    'hub-confirmed': 'Notes merged',
   },
 }
 
@@ -93,6 +104,8 @@ const KIND_TITLES: Record<TxKind, string> = {
   'transfer-shielded-received': 'Received',
   'yield-deposit': 'Vault deposit',
   'yield-withdraw': 'Vault withdrawal',
+  // Note consolidation: merges the wallet's small notes into fewer, larger ones (a self-spend).
+  consolidate: 'Merge notes',
 }
 
 export function kindTitle(kind: TxKind): string {
@@ -132,6 +145,11 @@ export function recordTitle(record: TxRecord): string {
       return 'Added to earn vault'
     case 'yield-withdraw':
       return 'Withdrawn from earn vault'
+    case 'consolidate': {
+      // Chain-recovered merges carry no note counts, so the count is optional.
+      const meta = record.meta as { notesMerged?: number }
+      return meta.notesMerged !== undefined ? `Merged ${meta.notesMerged} notes` : 'Merged notes'
+    }
   }
   // Defensive fallback for any future kind not covered above.
   return kindTitle(record.kind)

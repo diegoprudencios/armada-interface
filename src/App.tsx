@@ -8,18 +8,20 @@ import { AppLayout } from '@/components/AppLayout'
 import { SignInFlow } from '@/components/onboarding'
 import { ShieldModal } from '@/components/shield'
 import { SendModal } from '@/components/payments'
+import { MergeModal } from '@/components/consolidate/MergeModal'
 import { ReceiveDialog } from '@/components/receive'
 import { RequestModal } from '@/components/request'
 import { EarnModal } from '@/components/yield'
 import { SettingsModal } from '@/components/settings'
+import { SingleTabGate } from '@/components/SingleTabGate'
 import { useAutoLock } from '@/hooks/useAutoLock'
 import { usePayViaLinkIntent } from '@/hooks/usePayViaLinkIntent'
 import { useHistoryRecovery } from '@/hooks/useHistoryRecovery'
 import { useIncomingTransferDetector } from '@/hooks/useIncomingTransferDetector'
 import { useNowTicker } from '@/hooks/useNowTicker'
-import { useFees } from '@/hooks/useFees'
 import { useShieldedBalanceSync } from '@/hooks/useShieldedBalanceSync'
 import { useShieldedSyncPoll } from '@/hooks/useShieldedSyncPoll'
+import { useShieldedWatch } from '@/hooks/useShieldedWatch'
 import { useNullifierCrossCheck } from '@/hooks/useNullifierCrossCheck'
 import { useTabVisible } from '@/hooks/useTabVisible'
 import { useDebugSync } from '@/hooks/useDebugSync'
@@ -35,6 +37,7 @@ import '@/features/shield-xchain'
 import '@/features/unshield'
 import '@/features/unshield-xchain'
 import '@/features/transfer-shielded'
+import '@/features/consolidate'
 import '@/features/yield-deposit'
 import '@/features/yield-withdraw'
 import { startEngine } from '@/lib/tx/executor'
@@ -53,6 +56,7 @@ import {
   shieldedWalletAtom,
   shieldedWalletsAtom,
 } from '@/state/wallet'
+import { anotherTabActiveAtom } from '@/state/ui'
 
 export function App() {
   useTabVisible()
@@ -76,16 +80,19 @@ export function App() {
   // Drive periodic wallet.sync() (visibility-gated) so live balance + incoming-transfer updates keep
   // flowing — the SDK-native replacement for the stock engine's continuous scan poller.
   useShieldedSyncPoll()
+  // Liveness floor under the adaptive poll — the SDK's wallet.watch() auto-sync loop (immediate-run +
+  // error backoff), visibility-gated, coalescing with the poll's sync() so the two never double-scan.
+  useShieldedWatch()
   // WI-5: after each shielded scan completes, cross-check the wallet's own unspent notes against
   // the hub PrivacyPool's on-chain nullifier set and block spending if the indexer omitted a spend.
   useNullifierCrossCheck()
   // Poll the connected wallet's hub USDC balance into usdcBalancesAtom so the ShieldModal's
   // MAX is populated and the user can shield without typing an arbitrary number.
   useUsdcBalances()
-  // Fetch the relayer's fee schedule on mount + auto-refresh near expiry. Modals all share the
-  // same cached quote via feeQuoteAtom; mounting at root ensures it's warm by the time any
-  // modal opens (otherwise the first modal sees `quote=null` briefly).
-  useFees()
+  // NOTE: the relayer fee schedule is intentionally NOT fetched here. Each fee-consuming flow
+  // (`useShieldFlow`, `useUnshieldFlow`, `SendModal`, `EarnModal`) mounts its own `useFees()`, so
+  // `/fees` is only hit while such a modal is open — not on the sign-in screen or the idle
+  // dashboard. React Query dedups across a flow's consumers.
 
   const setDevMockBalance = useSetAtom(devMockBalanceAtom)
 
@@ -98,6 +105,7 @@ export function App() {
   }, [setDevMockBalance])
 
   const wallet = useAtomValue(shieldedWalletAtom)
+  const anotherTabActive = useAtomValue(anotherTabActiveAtom)
   const setShieldedWallets = useSetAtom(shieldedWalletsAtom)
   const setActiveWalletId = useSetAtom(activeShieldedWalletIdAtom)
   const [mode, setMode] = useState<GuardMode>('pre-migration')
@@ -170,6 +178,12 @@ export function App() {
     if (next) setMode(next)
   }, [mode, wallet.status])
 
+  // Another tab already holds the shielded scan instance (SDK enforces one per origin) — supersede
+  // every mode with the single-tab gate so the user sees a clear message, not a broken shell.
+  if (anotherTabActive) {
+    return <SingleTabGate />
+  }
+
   if (mode === 'pre-migration' || mode === 'pre-init') {
     // Brief pre-render gap. `pre-migration` waits for the v2 schema-migration to drop legacy
     // localStorage + IDB state (usually under 50ms — synchronous localStorage clear plus a
@@ -198,6 +212,7 @@ export function App() {
       <ReceiveDialog />
       <RequestModal />
       <SettingsModal />
+      <MergeModal />
     </>
   )
 }

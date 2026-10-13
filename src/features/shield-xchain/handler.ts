@@ -16,16 +16,15 @@ import { getChainById, getNetworkConfig } from '@/config/network'
 import { createProvider } from '@/lib/rpc'
 import {
   getShieldedAddress as kmGetShieldedAddress,
-  getWalletId as kmGetWalletId,
   isUnlocked as kmIsUnlocked,
 } from '@/lib/shielded/keyManager'
-import { refreshShieldedBalances } from '@/lib/shielded/sync'
 import {
   generateRandomShieldPrivateKey,
   type ShieldRequestData,
 } from '@/lib/shielded/shield'
 import { createShieldRequestSdk } from '@/lib/shielded/shield-sdk'
-import { extractCctpMessageFromReceipt, messageReceivedTopic } from '@/lib/cctp'
+import { extractCctpMessageFromReceipt, messageReceivedTopic, readCctpFromLogs } from '@/lib/cctp'
+import type { Log } from 'viem'
 import { cctpMaxFeeForKind, submitRelay, fetchCctpDeliveryStatus } from '@/lib/relayer'
 import { handleRelaySubmitError } from '@/lib/tx/relaySubmit'
 import { signUsdcPermit } from '@/lib/wallet/permit'
@@ -38,7 +37,7 @@ import {
   type ShieldDataStruct,
 } from '@/lib/wallet/shield-intent'
 import { ensureChain } from '@/lib/network-switch'
-import { advance, markFailed, markWaiting, patchArtifacts } from '@/lib/tx/reducer'
+import { advance, markFailed, markWaiting, patchArtifacts, patchMeta } from '@/lib/tx/reducer'
 import { recordBroadcastHash } from '@/lib/tx/broadcast'
 import { poll, pollBudgetMs } from '@/lib/tx/poller'
 import { asTxError, waitForReceiptOrFail } from '@/lib/tx/receipt'
@@ -47,7 +46,9 @@ import { classifyHandlerError } from '@/lib/tx/errors'
 import { track } from '@/lib/telemetry'
 import { scanCctpDeliveryWindow } from '../unshield-xchain/scan'
 import type { StageHandler } from '@/lib/tx/executor'
-import type { TxRecord } from '@/lib/tx/types'
+import type { MetaShieldXchain, TxRecord } from '@/lib/tx/types'
+import { deliveredShieldMeta } from './reconcile'
+import { recordedShieldFees } from '@/lib/shielded/shieldReconcile'
 
 // MessageReceived ABI for ethers.Interface.parseLog. We route the destination scan through
 // ethers (rather than viem) so the app-wide bisecting JsonRpcProvider patch
@@ -112,8 +113,9 @@ const PRIVACY_POOL_CLIENT_SHIELD_ABI = [
  */
 export const shieldXchainHandler: StageHandler<'shield-xchain'> = {
   kind: 'shield-xchain',
-  // Iris/hub polling can be resumed; pre-receipt stages can't (ephemeral shield build + any permit sig + on-chain submit).
-  resumableFrom: ['submit-relayer', 'iris-attestation-pending'],
+  // Iris/hub polling + its collapsed tail stages can be resumed; pre-receipt stages can't (ephemeral
+  // shield build + any permit sig + on-chain submit).
+  resumableFrom: ['submit-relayer', 'iris-attestation-pending', 'iris-attestation-ready', 'hub-mint-pending'],
 
   async run(record, ctx) {
     try {
@@ -129,10 +131,15 @@ export const shieldXchainHandler: StageHandler<'shield-xchain'> = {
           await ctx.upsert(advance(record, 'iris-attestation-pending'))
           return
         case 'iris-attestation-pending':
+        // The collapsed tail stages are normally walked through synchronously inside
+        // runWaitForDelivery, but resume (#4) can re-enter run() with the record parked at one of
+        // them. Re-enter the delivery wait — it re-polls (idempotent: finds the already-delivered
+        // message) and walks to terminal — rather than falling through to a no-op that would
+        // busy-loop the chain. (hub-mint-confirmed is terminal, so the loop never calls run() there.)
+        case 'iris-attestation-ready':
+        case 'hub-mint-pending':
           await runWaitForDelivery(record, ctx)
           return
-        // Remaining stages are walked through inside runWaitForDelivery. Resume-on-load lands
-        // here only if we crashed mid-walk; we're already terminal in that case.
       }
     } catch (err) {
       if (ctx.signal.aborted) return
@@ -460,8 +467,8 @@ async function runDirectSubmit(
  *
  * Zero EVM wallet prompts in this stage — the user already signed the USDC permit during
  * build-proof. The relayer broadcasts on the user's behalf and pays gas in the source
- * chain's native token; the wrapper pulls `amount + fee` USDC from the user via the permit
- * and reimburses the relayer.
+ * chain's native token; the wrapper pulls `amount` USDC (fee included) from the user via the
+ * permit and reimburses the relayer out of it.
  */
 async function runGaslessSubmit(
   record: TxRecord<'shield-xchain'>,
@@ -774,9 +781,37 @@ async function runWaitForDelivery(
     })
   }
 
+  // Reconcile the record to the ACTUAL delivered values so the confirmed receipt AND the Complete
+  // screen match the note that landed — identical to what history recovery reconstructs on a rescan.
+  // The submit-time meta is only an estimate: Circle sets the CCTP `feeExecuted` at execution, and the
+  // protocol shield fee is exact only once the commitment lands. Sources mirror the recovery path:
+  //   - amount (true deposit = CCTP burn) + cctpFee (feeExecuted): the hub delivery MessageReceived.
+  //   - protocolFee (shield fee) + relayer fee: the SDK history entry for the hub tx, after a sync.
+  // Best-effort per field — a failed fetch/sync just leaves that field's estimate, which a later
+  // rescan corrects.
+  const reconciledMeta: Partial<MetaShieldXchain> = {}
+  try {
+    const deliveryReceipt = result.value ? await hubProvider.getTransactionReceipt(result.value) : null
+    if (deliveryReceipt) {
+      const info = readCctpFromLogs({
+        logs: deliveryReceipt.logs as unknown as ReadonlyArray<Log>,
+        messageTransmitterAddress: hubMessageTransmitter,
+      })
+      Object.assign(reconciledMeta, deliveredShieldMeta(info))
+    }
+  } catch { /* best-effort — keep the submit-time estimate */ }
+
+  // Sync (awaited — option A) so the just-landed shield is scanned, then read the ACTUAL protocol
+  // shield fee (+ relayer fee) off its history entry. The hub delivery tx (`result.value`) is the tx
+  // that minted + shielded on the hub, so it's the txid the SDK keys the shield entry under.
+  // Shared with the same-chain shield (`recordedShieldFees`); best-effort — a failed sync/read keeps the estimate.
+  if (result.value) Object.assign(reconciledMeta, await recordedShieldFees(result.value))
+
   // Walk through the three intermediate stages with brief gaps so the stepper renders each row
   // as "current" rather than flashing through transitions in a single frame. Same pattern as the
-  // inverse-direction handler — see its docstring for the visual-delay rationale.
+  // inverse-direction handler — see its docstring for the visual-delay rationale. The reconciled
+  // actuals are folded into the SAME write that reaches the terminal stage, so the Complete screen
+  // renders the real figures directly (no estimate-then-snap flash).
   const STAGE_VISUAL_DELAY_MS = 350
   const skipStages = ['iris-attestation-ready', 'hub-mint-pending', 'hub-mint-confirmed'] as const
   for (let i = 0; i < skipStages.length; i++) {
@@ -785,6 +820,9 @@ async function runWaitForDelivery(
     if (ctx.signal.aborted) return
     const next = skipStages[i]!
     cursor = advance(cursor, next, next === 'hub-mint-confirmed' ? { destTxHash: result.value } : {})
+    if (next === 'hub-mint-confirmed' && Object.keys(reconciledMeta).length > 0) {
+      cursor = patchMeta(cursor, reconciledMeta)
+    }
     await ctx.upsert(cursor)
     if (i < skipStages.length - 1) {
       await new Promise<void>(resolve => {
@@ -793,10 +831,5 @@ async function runWaitForDelivery(
       })
       if (ctx.signal.aborted) return
     }
-  }
-
-  // The shield commitment is now on the hub merkle tree — refresh balances so the UI ticks up.
-  if (kmIsUnlocked()) {
-    void refreshShieldedBalances(kmGetWalletId()).catch(() => {})
   }
 }

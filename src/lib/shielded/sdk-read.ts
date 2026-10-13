@@ -10,13 +10,17 @@ import {
   type ArmadaSdk,
   type HistoryEntry,
 } from '@armada/sdk'
+import { getDefaultStore } from 'jotai'
+import { anotherTabActiveAtom } from '@/state/ui'
 import { getCachedDeployments, getUsdcAddress, loadYieldDeployment } from '../../config/deployments'
 import { getNetworkConfig } from '../../config/network'
+import { supportedCircuitShapeKeys } from '../../config/circuits'
 import * as keyManager from './keyManager'
 import { createInterfaceArtifactSource, createInterfaceProver } from './sdk-prover'
 import { emitBalanceChange, emitScanStatus } from './balance-bus'
 import { sdkTelemetrySink } from './sdk-telemetry'
 import { track } from '../telemetry'
+import type { MergeToken } from './merge-intent'
 
 /** The shielded yield-vault share token (ayUSDC), if a yield deployment exists. */
 async function vaultTokenAddress(): Promise<`0x${string}` | undefined> {
@@ -39,10 +43,10 @@ async function readPathConfig(): Promise<{
     poolAddress: `0x${string}`
     deployBlock: number
     usdcAddress: `0x${string}`
-    additionalTokens?: `0x${string}`[]
     wrappers?: { yieldAdapter?: `0x${string}` }
     confirmationDepth: number
     finalityThreshold: number
+    supportedShapes: readonly string[]
   }
   rpc: { urls: string[] }
   indexer?: { url: string }
@@ -55,8 +59,6 @@ async function readPathConfig(): Promise<{
   if (!poolAddress || !usdcAddress) {
     throw new Error('sdk-read: hub deployment missing privacyPool or usdc')
   }
-  // Scan the yield-vault share token too, so the SDK can report shielded ayUSDC shares.
-  const vault = await vaultTokenAddress()
   // Yield adapter → `pool.wrappers.yieldAdapter`: lets the SDK natively classify yield ops (history
   // `yield-deposit`/`yield-withdraw` categories) and bind the correct `crossContract` fee tier.
   const yieldAdapter = await yieldAdapterAddress()
@@ -70,10 +72,13 @@ async function readPathConfig(): Promise<{
       poolAddress,
       deployBlock: deployments.hub.deployBlock ?? 0,
       usdcAddress,
-      ...(vault ? { additionalTokens: [vault] } : {}),
       ...(yieldAdapter ? { wrappers: { yieldAdapter } } : {}),
       confirmationDepth: getNetworkConfig().confirmationDepth,
       finalityThreshold: getNetworkConfig().finalityThreshold,
+      // Fail-fast guard: reject an unprovable circuit shape at plan time with a typed
+      // UnsupportedCircuitShapeError, rather than late at artifact fetch (a 404) or on-chain. Keys are
+      // the SDK's unpadded `NxM` format (see supportedCircuitShapeKeys — the manifest is padded).
+      supportedShapes: supportedCircuitShapeKeys(),
     },
     rpc: { urls: [...hub.rpcUrls] },
     ...(indexerUrl ? { indexer: { url: indexerUrl } } : {}),
@@ -148,6 +153,15 @@ async function ensureInstance(): Promise<SdkInstance> {
   pendingInstance = { address: engineAddress, promise }
   try {
     return await promise
+  } catch (err) {
+    // Another live SDK instance in this origin (a second tab) holds the scan DB — the SDK refuses to
+    // open a concurrent one (it would corrupt scan state). Surface the full-screen single-tab gate;
+    // still rethrow so the calling read fails as before (the gate takes over the screen). Match on the
+    // SDK's stable `code` (its guidance: match `code`, never instance/message).
+    if (typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'STORAGE_CONFLICT') {
+      getDefaultStore().set(anotherTabActiveAtom, true)
+    }
+    throw err
   } finally {
     // Clear the marker only if still ours — a later identity change may have replaced it mid-build.
     if (pendingInstance !== null && pendingInstance.promise === promise) pendingInstance = null
@@ -281,10 +295,9 @@ export async function readSdkUsdcBalance(): Promise<{ spendable: bigint; pending
   return usdc ? { spendable: usdc.spendable, pending: usdc.pending } : { spendable: 0n, pending: 0n }
 }
 
-// TODO(tier3b): split yield shares into spendable/pending like readSdkUsdcBalance, so the withdraw MAX
-// doesn't offer shares still inside the finalityThreshold buffer. Low urgency: on local finalityThreshold
-// is 0 (no pending shares), and on sepolia the pre-proof preflight gate (assertSpendPreflight) fast-fails
-// a redeem of not-yet-spendable shares — so this is a MAX-button nicety, not a correctness hole.
+// The whole vault position (spendable + pending) — what the dashboard and Earn modal show. The withdraw Max
+// doesn't read it: it's the SDK's max over spendable shares (`unshield-sdk.ts::maxUnshieldAmount`), so shares
+// still inside the finalityThreshold buffer aren't offered.
 /** Read the current shielded yield-vault shares (ayUSDC) from the scan state. 0 if no vault. Does not sync. */
 export async function readSdkYieldShares(): Promise<bigint> {
   const vault = await vaultTokenAddress()
@@ -293,6 +306,25 @@ export async function readSdkYieldShares(): Promise<bigint> {
   const vaultHash = getTokenDataHash(getTokenDataERC20(vault))
   const shares = (await wallet.balances()).find(b => b.tokenHash === vaultHash)
   return shares ? shares.spendable + shares.pending : 0n
+}
+
+/** The token address a note merge targets: the hub USDC, or the yield-vault share token (undefined with
+ *  no yield deployment). */
+export async function mergeTokenAddress(token: MergeToken): Promise<`0x${string}` | undefined> {
+  if (token === 'shares') return vaultTokenAddress()
+  return (await readPathConfig()).pool.usdcAddress
+}
+
+/** How many spendable notes back each mergeable token's balance — the cue to offer a merge. Does not sync. */
+export async function readSdkNoteCounts(): Promise<Record<MergeToken, number>> {
+  const [{ wallet }, usdc, shares] = await Promise.all([ensureInstance(), mergeTokenAddress('usdc'), mergeTokenAddress('shares')])
+  const balances = await wallet.balances()
+  const notesOf = (address: `0x${string}` | undefined): number => {
+    if (address === undefined) return 0
+    const hash = getTokenDataHash(getTokenDataERC20(address))
+    return balances.find(b => b.tokenHash === hash)?.spendableNotes ?? 0
+  }
+  return { usdc: notesOf(usdc), shares: notesOf(shares) }
 }
 
 /** Reconstruct the SDK wallet's tx history from the current scan state (optionally only entries at/after `sinceBlock`). Does not sync. */

@@ -1,11 +1,19 @@
-# Netlify build config — armada-interface deploy (standalone repo; app is at the repo root).
+# Netlify config — armada-interface deploy (standalone repo; app is at the repo root).
+#
+# HOW THIS SITE DEPLOYS: the production bundle exceeds Netlify's standard build-container memory and
+# OOM-kills there (SIGKILL, exit 137). So the build runs in GitHub Actions (.github/workflows/deploy.yml)
+# on a 16 GB runner and the prebuilt dist/ is pushed here via the Netlify CLI — free-plan friendly, no
+# Netlify build minutes used. **Disable Netlify's own continuous deployment for this site** (Site config
+# → Build & deploy → stop/lock builds) so only the workflow publishes. The [build] block below is kept
+# for reference / `netlify build` locally; Netlify does not run it in the CI-deploy model. The
+# [[redirects]] + [[headers]] blocks ARE still applied — the CLI reads them from this file on deploy.
 #
 # Env vars set in the Netlify UI (not committed):
 #   VITE_WALLETCONNECT_PROJECT_ID  required for WalletConnect modal
 #   VITE_RELAYER_URL               public relayer endpoint when the VPS is live
 #                                  (omit until then — submit flows will error,
 #                                   but UI/flow review still works)
-#   DEPLOYMENT_INSTANCE            optional override; defaults to "demo1"
+#   DEPLOYMENT_INSTANCE            optional override; defaults to "demo3"
 #                                  (build-step variable only, no VITE_ prefix
 #                                   because it's never exposed to bundled JS)
 #   DEPLOYMENT_REF                 optional — commit SHA of ship-armada/armada-deployments to
@@ -20,24 +28,12 @@
   #   1. install with `npm ci` (respects the committed lockfile — never re-resolves the dep graph
   #      fresh). The package.json `postinstall` runs ensure-linux-native-modules.mjs to work around
   #      Vercel/Netlify npm optional-native bug #4828 (rollup/lightningcss/oxide linux binaries).
-  #   2. fetch the selected deployment instance's manifests from the armada-deployments repo and
-  #      write them under public/api/deployments/ with the filenames the interface fetches today
+  #   2. fetch the selected deployment instance's manifests from the armada-deployments repo (driven
+  #      by that instance's manifest.json index — no hardcoded chain list) into public/api/deployments/
   #   3. verify the committed ZK artifacts, then build
   command = """
     npm ci && \
-    mkdir -p public/api/deployments && \
-    INSTANCE="${DEPLOYMENT_INSTANCE:-demo1}" && \
-    REF="${DEPLOYMENT_REF:-main}" && \
-    BASE="https://raw.githubusercontent.com/ship-armada/armada-deployments/${REF}/testnet/${INSTANCE}" && \
-    echo "Fetching deployment manifests from instance: ${INSTANCE} (ref: ${REF})" && \
-    curl -sfL -o public/api/deployments/hub-sepolia-v3.json               "${BASE}/sepolia/cctp.json" && \
-    curl -sfL -o public/api/deployments/client-sepolia-v3.json            "${BASE}/base-sepolia/cctp.json" && \
-    curl -sfL -o public/api/deployments/clientB-sepolia-v3.json           "${BASE}/arbitrum-sepolia/cctp.json" && \
-    curl -sfL -o public/api/deployments/privacy-pool-hub-sepolia.json     "${BASE}/sepolia/privacy-pool.json" && \
-    curl -sfL -o public/api/deployments/privacy-pool-client-sepolia.json  "${BASE}/base-sepolia/privacy-pool.json" && \
-    curl -sfL -o public/api/deployments/privacy-pool-clientB-sepolia.json "${BASE}/arbitrum-sepolia/privacy-pool.json" && \
-    curl -sfL -o public/api/deployments/yield-hub-sepolia.json            "${BASE}/sepolia/yield.json" && \
-    curl -sfL -o public/api/deployments/fee-module-hub-sepolia.json       "${BASE}/sepolia/fee-module.json" && \
+    node scripts/fetch-sepolia-deployments.mjs && \
     npm run prepare:artifacts && \
     npm run build
   """

@@ -11,8 +11,14 @@ import {
   ProofExpiredError,
   RootMismatchError,
   StorageConflictError,
+  TooFragmentedError,
+  UnsupportedCircuitShapeError,
+  NothingToConsolidateError,
+  ProofVerificationError,
+  ProverWorkerError,
 } from '@armada/sdk'
 import { classifyHandlerError } from './errors'
+import { SpendFeeIncreasedError } from '@/lib/shielded/spend-fee-error'
 import { asTxError } from './receipt'
 
 const STD_ERR_ABI = [
@@ -183,6 +189,30 @@ describe('classifyHandlerError — @armada/sdk ArmadaError branch', () => {
     expect(classifyHandlerError(new StorageConflictError('concurrent write'), 'fallback').code).toBe('RPC_ERROR')
   })
 
+  it('tags every SDK-derived TxError with the originating ArmadaError code (sdkCode)', () => {
+    // WHY: several SDK codes share a TxErrorCode (PRE_FLIGHT_REVERT), so failure reporting needs the
+    // original code to tell a stale-root refusal from a broken proof (failureReport.ts).
+    expect(classifyHandlerError(new RootMismatchError('tree moved'), 'fallback').sdkCode).toBe('ROOT_MISMATCH')
+    expect(classifyHandlerError(new ProofVerificationError('bad proof'), 'fallback').sdkCode).toBe('PROOF_VERIFICATION')
+    expect(classifyHandlerError(new InvalidKeyMaterialError('bad key'), 'fallback').sdkCode).toBe('INVALID_KEY_MATERIAL')
+    expect(classifyHandlerError(new Error('plain'), 'fallback').sdkCode).toBeUndefined()
+  })
+
+  it('maps ProofVerificationError to PRE_FLIGHT_REVERT (the proof was never submitted)', () => {
+    const r = classifyHandlerError(new ProofVerificationError('proof failed its self-check'), 'fallback')
+    expect(r.code).toBe('PRE_FLIGHT_REVERT')
+    expect(r.message).toMatch(/not submitted/i)
+  })
+
+  it('maps ProverWorkerError to a retryable PRE_FLIGHT_REVERT (the prover stopped; nothing was sent)', () => {
+    // WHY: the SDK rejects in-flight proofs with ProverWorkerError when the proving worker crashes
+    // (e.g. out of memory) and starts a fresh worker on the next request — so "try again" is honest.
+    const r = classifyHandlerError(new ProverWorkerError('prover worker failed: out of memory'), 'fallback')
+    expect(r.code).toBe('PRE_FLIGHT_REVERT')
+    expect(r.message).toMatch(/try again/i)
+    expect(r.message).not.toMatch(/out of memory/) // category copy, not the raw worker message
+  })
+
   it('falls through to OTHER for an unmapped SDK code, surfacing the (truncated) SDK message', () => {
     // WHY: identity/signing-path codes (INVALID_KEY_MATERIAL, …) and any FUTURE ArmadaError should
     // be surfaced honestly rather than swallowed — but still run through mapRevertToMessage so a
@@ -223,5 +253,41 @@ describe('classifyHandlerError — ChainMismatchError branch (W-4)', () => {
     const outer = new Error('write failed') as Error & { cause: unknown }
     outer.cause = inner
     expect(classifyHandlerError(outer, 'fallback', undefined, 31337).code).toBe('RPC_ERROR')
+  })
+})
+
+describe('classifyHandlerError — shape-aware planner errors', () => {
+  it('maps UnsupportedCircuitShapeError to PRE_FLIGHT_REVERT (nothing sent) with the merge-notes remedy', () => {
+    const r = classifyHandlerError(new UnsupportedCircuitShapeError('no circuit for 5x3'), 'fallback')
+    expect(r.code).toBe('PRE_FLIGHT_REVERT')
+    expect(r.message).toMatch(/merge your notes/i)
+    expect(r.remedy).toBe('merge-notes')
+  })
+
+  it('maps TooFragmentedError to PRE_FLIGHT_REVERT with the merge-notes remedy', () => {
+    const r = classifyHandlerError(new TooFragmentedError('needs 30 notes across 5 groups'), 'fallback')
+    expect(r.code).toBe('PRE_FLIGHT_REVERT')
+    expect(r.message).toMatch(/merge your notes/i)
+    expect(r.remedy).toBe('merge-notes')
+  })
+
+  it('other pre-flight failures carry no remedy', () => {
+    expect(classifyHandlerError(new NothingToConsolidateError('x'), 'fallback').remedy).toBeUndefined()
+  })
+})
+
+describe('classifyHandlerError — transfer fee rose since review', () => {
+  it('maps SpendFeeIncreasedError to FEE_EXPIRED (retry is futile — start a new send to re-review)', () => {
+    const r = classifyHandlerError(new SpendFeeIncreasedError(20_000n, 40_000n), 'fallback')
+    expect(r.code).toBe('FEE_EXPIRED')
+    expect(r.message).toMatch(/higher fee/i)
+  })
+})
+
+describe('classifyHandlerError — consolidation', () => {
+  it('maps NothingToConsolidateError to PRE_FLIGHT_REVERT with plain "nothing to merge" copy', () => {
+    const r = classifyHandlerError(new NothingToConsolidateError('nothing worth merging'), 'fallback')
+    expect(r.code).toBe('PRE_FLIGHT_REVERT')
+    expect(r.message).toMatch(/nothing to merge/i)
   })
 })

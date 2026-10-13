@@ -12,7 +12,7 @@ import {
   BALANCE_ROLL_DIGIT_STAGGER_MS,
 } from '@/components/dashboard/BalanceCard/balanceRevealMotion'
 import { formatUsdcAmount, formatUsdcPlain } from '@/lib/format'
-import type { DisplayFees } from '@/lib/fees/displayFees'
+import { formatNativeGasAmount, type DisplayFees } from '@/lib/fees/displayFees'
 import { incompleteCtaShakeClass } from '@/design'
 import styles from './DepositAmountCard.module.css'
 
@@ -67,6 +67,24 @@ export interface DepositAmountCardProps {
   displayFees?: DisplayFees
   feeLoading?: boolean
   /**
+   * True while the fee path is still being determined — today the shield's relayer-reachability
+   * probe (gasless USDC fee vs direct ETH gas is unknown until it settles). Suppresses both fee
+   * segments and shows a neutral "Estimating fees…" caption instead of prematurely committing to
+   * the direct-path ETH gas figure that may vanish a moment later (#23).
+   */
+  feeResolving?: boolean
+  /**
+   * True when the fee can't be worked out for this amount (e.g. a fragmented wallet's send the planner
+   * refuses). The caption shows "—" instead of a figure, since any quote would suggest the send fits.
+   */
+  feeUnavailable?: boolean
+  /**
+   * True when the user pays network gas themselves — the direct shield path (`!gaslessMode`). Gates
+   * the "+ ~X ETH gas" caption segment + the tooltip's network-gas line. Relayer-mediated flows
+   * (all spends, gasless shield) pass false: the relayer covers gas, so no ETH figure is shown.
+   */
+  userPaysNativeGas?: boolean
+  /**
    * Optional flow-level breakdown (broadcaster fee, recipient-receives, total-deducted) layered
    * onto the tooltip and into the FEE label total. Used by relayer-mediated / gasless flows
    * where the displayed total USDC fee is `protocolFee + broadcasterFee`.
@@ -110,6 +128,9 @@ export function DepositAmountCard({
   pendingBalance,
   displayFees,
   feeLoading = false,
+  feeResolving = false,
+  feeUnavailable = false,
+  userPaysNativeGas = false,
   flowBreakdown,
   onMax,
   maxInput,
@@ -218,13 +239,29 @@ export function DepositAmountCard({
   // amount numeral + balance row (mockup parity) alongside the above-field warning tooltip.
   const hasError = Boolean(error)
 
-  // Total displayed fee (protocol + broadcaster + CCTP). Rendered as the under-amount caption
+  // Total displayed fee (protocol + broadcaster + CCTP — except a CCTP fee taken from the amount in transit, which
+  // isn't charged on top). Rendered as the under-amount caption
   // ("+ $X.XX FEE") once an amount is entered and the fee is non-zero — matching the mockup, which
   // moved the fee off a bottom row and into a caption directly below the amount.
   const totalFeeRaw = displayFees
-    ? displayFees.totalFee + (flowBreakdown?.broadcasterFee ?? 0n) + (flowBreakdown?.cctpFee ?? 0n)
+    ? displayFees.totalFee + (flowBreakdown?.broadcasterFee ?? 0n)
+      + (flowBreakdown?.cctpFeeFromAmount ? 0n : (flowBreakdown?.cctpFee ?? 0n))
     : 0n
-  const showFee = showActiveAmount && displayFees !== undefined && totalFeeRaw > 0n
+  // While the fee path is still resolving we don't yet know if it's gasless (USDC) or direct (ETH
+  // gas), so surface a neutral "Estimating…" caption instead of either committed segment.
+  const showResolving = showActiveAmount && feeResolving
+  const showUnavailable = showActiveAmount && !feeResolving && feeUnavailable
+  const showFee = showActiveAmount && !feeResolving && !feeUnavailable && displayFees !== undefined && totalFeeRaw > 0n
+  // A fee taken from the amount (a shield) or from the proceeds (a vault withdrawal) is included in the figure typed,
+  // not added to it — so it reads "incl.", and "+" is left for a fee charged on top (G-7).
+  const feePrefix = flowBreakdown?.feesFromAmount || flowBreakdown?.feeFromProceeds ? 'incl.' : '+'
+  // The ETH network-gas segment shows ONLY when the caller says the user pays gas themselves — the
+  // direct shield path (`!gaslessMode`). This is an explicit signal, NOT inferred from a zero
+  // broadcaster fee: a relayer-submitted spend with a not-yet-loaded fee is also 0, and must not
+  // surface an ETH gas line. On the direct hub shield there's no USDC fee at all, so this is the
+  // only cost the caption can show.
+  const nativeGas = displayFees?.nativeGas ?? null
+  const showGas = showActiveAmount && !feeResolving && userPaysNativeGas && nativeGas !== null
 
   return (
     <div
@@ -299,17 +336,26 @@ export function DepositAmountCard({
           </AmountFieldWarning>
         </label>
 
-        {/* Fee caption (mockup): "+ $X.XX FEE" directly under the amount. The line is always
-            reserved (non-breaking space when there's no fee) so the card height stays stable. The
-            breakdown tooltip is kept beside the value for the full protocol/broadcaster split. */}
+        {/* Fee caption (mockup): "+ $X.XX FEE" ("incl. $X.XX FEE" when the fee comes out of the amount) directly
+            under the amount, plus a "+ ~X ETH gas" segment on the direct path where the user pays network
+            gas from their own wallet (the
+            two combine on a direct cross-chain shield). The line is always reserved (non-breaking
+            space when there's no fee) so the card height stays stable. The breakdown tooltip is
+            kept beside the value for the full protocol/broadcaster/gas split. */}
         <div className={`armada-text-ui-label-md ${styles.feeCaption}`} role="status">
-          {showFee && displayFees ? (
+          {showResolving ? (
+            <span className={styles.feeResolving}>Estimating fees…</span>
+          ) : showUnavailable ? (
+            <span>{feePrefix} — FEE</span>
+          ) : (showFee || showGas) && displayFees ? (
             <>
-              <span>+ ${formatUsdcAmount(totalFeeRaw)} FEE</span>
+              {showFee ? <span>{feePrefix} ${formatUsdcAmount(totalFeeRaw)} FEE</span> : null}
+              {showGas && nativeGas ? <span>+ {formatNativeGasAmount(nativeGas)} gas</span> : null}
               <FeeBreakdownTooltip
                 fees={displayFees}
                 isLoading={feeLoading}
                 flowBreakdown={flowBreakdown}
+                userPaysNativeGas={userPaysNativeGas}
               />
             </>
           ) : (

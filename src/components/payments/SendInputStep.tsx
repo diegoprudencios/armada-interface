@@ -27,12 +27,16 @@ export interface SendInputStepProps {
   displayFees: DisplayFees
   flowBreakdown?: FlowFeeBreakdown
   feeLoading?: boolean
+  /** The fee is still being worked out (a private send being planned): the caption says so instead of a figure. */
+  feeResolving?: boolean
+  /** The fee can't be worked out for this amount (the planner refused it): the caption shows "—". */
+  feeUnavailable?: boolean
   gasChainId: number
   /**
    * When true, the relayer pays gas — suppresses the GasBalanceNotice. All three SendModal
-   * kinds (`transfer-shielded`, `unshield-local`, `unshield-xchain`) route through the relayer
-   * by default; the user pays native gas only when they've toggled Preferences →
-   * "Submit transactions from my wallet". Mirrors `ShieldModal`.
+   * kinds (`transfer-shielded`, `unshield-local`, `unshield-xchain`) are always relayer-submitted
+   * (a spend from the user's own wallet would link their EVM address to the shielded activity; #23),
+   * so this is always true here.
    */
   gaslessMode?: boolean
   onBack: () => void
@@ -57,6 +61,8 @@ export function SendInputStepContent({
   displayFees,
   flowBreakdown,
   feeLoading = false,
+  feeResolving = false,
+  feeUnavailable = false,
   gasChainId,
   gaslessMode = true,
   inputRef,
@@ -73,6 +79,8 @@ export function SendInputStepContent({
   | 'displayFees'
   | 'flowBreakdown'
   | 'feeLoading'
+  | 'feeResolving'
+  | 'feeUnavailable'
   | 'gasChainId'
   | 'gaslessMode'
   | 'inputRef'
@@ -101,6 +109,8 @@ export function SendInputStepContent({
           displayFees={displayFees}
           flowBreakdown={flowBreakdown}
           feeLoading={feeLoading}
+          feeResolving={feeResolving}
+          feeUnavailable={feeUnavailable}
           // maxInput drives the 25% / 50% / 75% / Max percent pills; onMax keeps the exact fee-aware cap.
           maxInput={maxInput}
           balanceRaw={max}

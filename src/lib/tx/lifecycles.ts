@@ -10,18 +10,24 @@ const XCHAIN_CAP = 60 * 60_000  // 60 min — Iris standard finality can take ~2
 
 const shield: TxLifecycle<'shield'> = {
   kind: 'shield',
-  stages: ['build-proof', 'submit-relayer', 'hub-confirmed'],
+  // `submit-relayer` = broadcasting (wallet prompt / relay POST); `hub-pending` = broadcast, awaiting
+  // on-chain confirmation. Splitting them lets the stepper show a distinct "Shielding / Confirming on
+  // chain" step for the confirmation wait instead of sitting on "Submitting" the whole time.
+  stages: ['build-proof', 'submit-relayer', 'hub-pending', 'hub-confirmed'],
   terminalSuccess: 'hub-confirmed',
-  retryableStages: ['submit-relayer'],
+  // `hub-pending` is retryable too: a POLL_TIMEOUT / receipt-wait failure lands there post-broadcast,
+  // and re-entry is idempotent (sourceTxHash present → never re-broadcasts, just re-waits).
+  retryableStages: ['submit-relayer', 'hub-pending'],
   estDuration: { p50: 8_000, p90: 25_000 },
   maxDurationMs: SHORT_CAP,
 }
 
 const unshieldLocal: TxLifecycle<'unshield-local'> = {
   kind: 'unshield-local',
-  stages: ['build-proof', 'submit-relayer', 'hub-confirmed'],
+  // `hub-pending` = broadcast, awaiting on-chain confirmation (see the shield lifecycle above).
+  stages: ['build-proof', 'submit-relayer', 'hub-pending', 'hub-confirmed'],
   terminalSuccess: 'hub-confirmed',
-  retryableStages: ['submit-relayer'],
+  retryableStages: ['submit-relayer', 'hub-pending'],
   estDuration: { p50: 8_000, p90: 25_000 },
   maxDurationMs: SHORT_CAP,
 }
@@ -63,11 +69,25 @@ const shieldXchain: TxLifecycle<'shield-xchain'> = {
 
 const transferShielded: TxLifecycle<'transfer-shielded'> = {
   kind: 'transfer-shielded',
-  stages: ['build-proof', 'submit-relayer', 'hub-confirmed'],
+  // `hub-pending` = broadcast, awaiting on-chain confirmation (see the shield lifecycle above).
+  stages: ['build-proof', 'submit-relayer', 'hub-pending', 'hub-confirmed'],
   terminalSuccess: 'hub-confirmed',
-  retryableStages: ['submit-relayer'],
+  retryableStages: ['submit-relayer', 'hub-pending'],
   estDuration: { p50: 8_000, p90: 25_000 },
   maxDurationMs: SHORT_CAP,
+}
+
+/**
+ * Note consolidation (armada-sdk #98) — relayer-submitted like a private send, but up to 4 proofs
+ * (proving is serial), so a little more time than a transfer before the expiry backstop trips.
+ */
+const consolidate: TxLifecycle<'consolidate'> = {
+  kind: 'consolidate',
+  stages: ['build-proof', 'submit-relayer', 'hub-pending', 'hub-confirmed'],
+  terminalSuccess: 'hub-confirmed',
+  retryableStages: ['submit-relayer', 'hub-pending'],
+  estDuration: { p50: 30_000, p90: 120_000 },
+  maxDurationMs: YIELD_CAP,
 }
 
 /**
@@ -87,18 +107,20 @@ const transferShieldedReceived: TxLifecycle<'transfer-shielded-received'> = {
 
 const yieldDeposit: TxLifecycle<'yield-deposit'> = {
   kind: 'yield-deposit',
-  stages: ['build-proof', 'submit-relayer', 'hub-confirmed'],
+  // `hub-pending` = broadcast, awaiting on-chain confirmation (see the shield lifecycle above).
+  stages: ['build-proof', 'submit-relayer', 'hub-pending', 'hub-confirmed'],
   terminalSuccess: 'hub-confirmed',
-  retryableStages: ['submit-relayer'],
+  retryableStages: ['submit-relayer', 'hub-pending'],
   estDuration: { p50: 10_000, p90: 30_000 },
   maxDurationMs: YIELD_CAP,
 }
 
 const yieldWithdraw: TxLifecycle<'yield-withdraw'> = {
   kind: 'yield-withdraw',
-  stages: ['build-proof', 'submit-relayer', 'hub-confirmed'],
+  // `hub-pending` = broadcast, awaiting on-chain confirmation (see the shield lifecycle above).
+  stages: ['build-proof', 'submit-relayer', 'hub-pending', 'hub-confirmed'],
   terminalSuccess: 'hub-confirmed',
-  retryableStages: ['submit-relayer'],
+  retryableStages: ['submit-relayer', 'hub-pending'],
   estDuration: { p50: 10_000, p90: 30_000 },
   maxDurationMs: YIELD_CAP,
 }
@@ -113,6 +135,7 @@ const LIFECYCLES = {
   'transfer-shielded-received': transferShieldedReceived,
   'yield-deposit': yieldDeposit,
   'yield-withdraw': yieldWithdraw,
+  consolidate,
 } as const
 
 export function lifecycleFor<K extends TxKind>(kind: K): TxLifecycle<K> {

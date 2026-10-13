@@ -9,7 +9,7 @@ EVM wallet), as two tabs on the amount step. Owned by `ShieldModal`, opened via 
 | Component | Purpose |
 |---|---|
 | `ShieldModal` | **Dumb renderer** — open/close chrome + per-tab step rendering. Composes two controller hooks: `hooks/useShieldFlow.ts` (Shield) + `hooks/useUnshieldFlow.ts` (Unshield). The typed amount carries across the tab toggle. |
-| `ShieldAmountStep` | Shared amount step (`ShieldAmountStepContent` + `Footer`) — `DepositAmountCard` with the Shield/Unshield `SegmentedControl` in its header + a chain picker (source for shield / destination for unshield) + `GasBalanceNotice` (wallet-submit). Direction-driven title/aria; footer gates Review on amount (+ shield's fee floor). Replaced the retired `ShieldInputStep`. |
+| `ShieldAmountStep` | Shared amount step (`ShieldAmountStepContent` + `Footer`) — `DepositAmountCard` with the Shield/Unshield `SegmentedControl` in its header + a chain picker (source for shield / destination for unshield) + `GasBalanceNotice` (direct-shield). Direction-driven title/aria; footer gates Review on amount (+ shield's fee floor). Replaced the retired `ShieldInputStep`. |
 | `ShieldReviewStep` / `ShieldCompleteStep` | **Shield direction** — frost card + `DepositReviewSummary`. |
 | `ShieldWalletStep` | Dedicated **Wallet** step (the mockup's step 3) — the live approve/sign checklist (`WalletConfirmList` + `lib/tx/shieldWalletSteps`). Title transitions "Preparing your deposit…" (proof building) → "Confirm in your wallet" (a prompt is live). Shield tab only; Unshield is relayer-submitted. |
 | (unshield direction review/complete) | Reuses `payments/SendReviewStep` + `SendCompleteStep` with `variant="withdraw"` (the "Review your USDC unshield" / "USDC unshield confirmed" copy). |
@@ -20,6 +20,8 @@ EVM wallet), as two tabs on the amount step. Owned by `ShieldModal`, opened via 
 - **Shield tab** → `useShieldFlow`: `shield` / `shield-xchain` by from-chain; wallet-signs (or gasless permit).
 - **Unshield tab** → `useUnshieldFlow`: `unshield-local` / `unshield-xchain` by **to-chain picker**; recipient is pinned to the connected wallet; relayer-submitted.
 - **Shield** step machine: `'input' → 'review' → 'wallet' → 'progress' → 'complete'` (or `'error'`). The `wallet` step shows the approve/sign checklist; `useShieldFlow` advances it → `progress` once `shieldWalletInteractionsComplete(record)`. Step indicator has 4 segments (Amount/Review/Wallet/Confirm).
+- An **unshield** is planned (`useSpendCheck`, amount + review steps), so the fee shown is the one its plan charges — the SDK can fold small change into it — with "Estimating fees…" / "—" until it's known; Confirm re-prices it at the fresh quote and the record stores total + per-proof fee.
+- A spend the wallet's notes are too fragmented for offers **"Merge notes"** — at review (from `useSpendCheck`: notice + disabled Confirm) and, as a fallback, on the error step (error `remedy: 'merge-notes'`) — opening the `merge` modal (`components/consolidate/`) with that spend as the one to unblock.
 - **Unshield** step machine: `'input' → 'review' → 'progress' → 'complete'` (no wallet step; relayer-submitted). 3-segment indicator.
 - Each controller owns its chain + step + submit; the shared `amountStr` lives at the modal and is synced across the toggle.
 
@@ -33,7 +35,7 @@ arbitrary `0x`/`0zk` recipient is the Send flow (`payments/`, "send" copy). Both
 
 ## What's wired now (Phase 2)
 
-- The shield handler (`features/shield/handler.ts`) is registered with the executor; `tx.submit()` runs the full `build-proof → submit-relayer → hub-confirmed` chain. Direct-submit path: the user's wallet prompts once (the on-chain `PrivacyPool.shield(...)`, with a one-time USDC `approve(MAX_UINT256)` first if allowance is low). Gasless path: one prompt for the EIP-2612 USDC permit. `shieldPrivateKey` is generated locally (random 32 bytes) at build-proof — no signing prompt for the Railgun-convention message; see `lib/shielded/shield.ts` for why randomness is correct.
+- The shield handler (`features/shield/handler.ts`) is registered with the executor; `tx.submit()` runs the full `build-proof → submit-relayer → hub-pending → hub-confirmed` chain. `submit-relayer` covers broadcasting (wallet prompt / relay POST); once broadcast the record advances to `hub-pending` for the on-chain confirmation wait (the "Shielding / Confirming on chain" step), then `hub-confirmed` (terminal). `hub-pending` is a resume/retry entry — re-entry is idempotent via `sourceTxHash` (never re-broadcasts). Direct-submit path: the user's wallet prompts once (the on-chain `PrivacyPool.shield(...)`, with a one-time USDC `approve(MAX_UINT256)` first if allowance is low). Gasless path: one prompt for the EIP-2612 USDC permit. `shieldPrivateKey` is generated locally (random 32 bytes) at build-proof — no signing prompt for the Railgun-convention message; see `lib/shielded/shield.ts` for why randomness is correct.
 - `useUsdcBalances()` polls the connected wallet's hub USDC balance into `usdcBalancesAtom` so the MAX is populated.
 - After confirmation the handler triggers `refreshShieldedBalances`, which fires the SDK's onBalanceUpdate callback and `useShieldedBalanceSync` writes the new shielded total into `shieldedUsdcAtom`.
 

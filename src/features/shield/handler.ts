@@ -14,10 +14,9 @@ import { loadDeployments } from '@/config/deployments'
 import { getIntegratorAddress } from '@/config/network'
 import {
   getShieldedAddress as kmGetShieldedAddress,
-  getWalletId as kmGetWalletId,
   isUnlocked as kmIsUnlocked,
 } from '@/lib/shielded/keyManager'
-import { refreshShieldedBalances } from '@/lib/shielded/sync'
+import { recordedShieldFees } from '@/lib/shielded/shieldReconcile'
 import {
   generateRandomShieldPrivateKey,
   type ShieldRequestData,
@@ -34,16 +33,17 @@ import {
 } from '@/lib/wallet/shield-intent'
 import { submitRelay } from '@/lib/relayer'
 import { handleRelaySubmitError } from '@/lib/tx/relaySubmit'
-import { poll, pollBudgetMs, pollRelayStatusOnce } from '@/lib/tx/poller'
+import { poll, pollBudgetMs, pollRelayStatusOnce, RELAYER_STATUS_POLL_INTERVAL_MS } from '@/lib/tx/poller'
 import { ensureChain } from '@/lib/network-switch'
-import { advance, markFailed, markWaiting, patchArtifacts } from '@/lib/tx/reducer'
+import { advance, markFailed, markWaiting, patchArtifacts, patchMeta } from '@/lib/tx/reducer'
 import { recordBroadcastHash } from '@/lib/tx/broadcast'
 import { track } from '@/lib/telemetry'
 import type { StageHandler } from '@/lib/tx/executor'
 import type { TxError, TxRecord } from '@/lib/tx/types'
 
 // PrivacyPool.shield ABI — the hub-side direct shield entry point. `integrator` lets the
-// contract route fees to a third party; we always pass ZeroAddress for direct user shields.
+// contract route fees to a third party; a direct shield passes the configured integrator
+// (`getIntegratorAddress()`, address(0) unless set), a gasless one address(0).
 // We carry the inline tuple/enum naming so viem can encode the calldata correctly.
 const PRIVACY_POOL_SHIELD_ABI = [
   {
@@ -95,8 +95,9 @@ const PRIVACY_POOL_SHIELD_ABI = [
  *
  *   1. `build-proof`    — generate a random shieldPrivateKey → build ShieldRequest (no signature —
  *                         see lib/shielded/shield.ts for why the shield key is random, not derived).
- *                         When gasless: sign an EIP-2612 USDC permit for `amount + fee` to the
- *                         wrapper address — the only wallet prompt on this path.
+ *                         When gasless: sign an EIP-2612 USDC permit for `amount` (fee included)
+ *                         to the wrapper address, then the EIP-712 ShieldIntent — the only wallet
+ *                         prompts on this path.
  *   2. `submit-relayer` — direct path: approve USDC + writeContract(PrivacyPool.shield).
  *                         gasless path: encode `gaslessShield(...)` calldata + POST /relay +
  *                         poll /status. No EVM wallet prompts after build-proof on this branch.
@@ -108,7 +109,7 @@ const PRIVACY_POOL_SHIELD_ABI = [
  */
 export const shieldHandler: StageHandler<'shield'> = {
   kind: 'shield',
-  resumableFrom: ['submit-relayer'],
+  resumableFrom: ['submit-relayer', 'hub-pending'],
 
   async run(record, ctx) {
     try {
@@ -116,7 +117,10 @@ export const shieldHandler: StageHandler<'shield'> = {
         await runBuildProof(record, ctx)
         return
       }
-      if (record.stage === 'submit-relayer') {
+      if (record.stage === 'submit-relayer' || record.stage === 'hub-pending') {
+        // `submit-relayer` broadcasts (then advances to `hub-pending`); `hub-pending` is the
+        // resume/retry entry for an already-broadcast tx — `runSubmitAndConfirm` is idempotent
+        // (sourceTxHash present → skips the broadcast, re-waits for confirmation).
         await runSubmitAndConfirm(record, ctx)
         return
       }
@@ -460,25 +464,29 @@ async function runDirectSubmit(
     // (whose upserts moved the seq forward) so the hash write isn't OCC-dropped.
     const broadcast = await recordBroadcastHash(working, shieldHash, ctx)
     if (broadcast.dismissed) return
-    // Prompt confirmed → active ("Submitting transaction") for the receipt wait below.
-    broadcastRecord = advance(broadcast.record, 'submit-relayer')
+    broadcastRecord = broadcast.record
+  }
+
+  // 3. Enter the on-chain confirmation stage. Idempotent: also runs on resume-from-submit-relayer
+  //    (a record persisted mid-broadcast), so the stepper shows "Shielding / Confirming on chain"
+  //    for the whole receipt wait instead of holding on "Submitting transaction".
+  if (broadcastRecord.stage !== 'hub-pending') {
+    broadcastRecord = advance(broadcastRecord, 'hub-pending')
     await ctx.upsert(broadcastRecord)
   }
 
-  // 3. Wait for confirmation. The SDK's merkle scan will pick up the new commitment via the
+  // 4. Wait for confirmation. The SDK's merkle scan will pick up the new commitment via the
   //    onBalanceUpdate callback — but we also kick a refresh explicitly so the UI doesn't have
   //    to wait for the SDK's poll interval. Timeout-and-signal-aware so a wedged RPC doesn't
   //    pin this handler for the full 10-min lifecycle cap.
   await waitForReceiptOrFail({ hash: shieldHash, signal: ctx.signal, chainId: record.meta.fromChainId })
 
-  if (kmIsUnlocked()) {
-    // Fire-and-forget — failures here are non-fatal (the periodic refresh would catch it).
-    void refreshShieldedBalances(kmGetWalletId()).catch(() => {})
-  }
-
-  const completed = advance(broadcastRecord, 'hub-confirmed', {
+  // Sync, then read the pool's actual protocol fee off the confirmed shield — the review figure can be an estimate
+  // (#74) — folded into the write that completes the record, so the Complete screen shows it directly.
+  const actual = await recordedShieldFees(shieldHash)
+  const completed = patchMeta(advance(broadcastRecord, 'hub-confirmed', {
     sourceTxHash: shieldHash,
-  })
+  }), actual)
   await ctx.upsert(completed)
 }
 
@@ -596,9 +604,17 @@ async function runGaslessSubmit(
     broadcastRecord = broadcast.record
   }
 
+  // Enter the on-chain confirmation stage before polling (idempotent for resume/retry from
+  // hub-pending), so the stepper shows "Shielding / Confirming on chain" for the relayer-status wait
+  // instead of holding on "Submitting transaction".
+  if (broadcastRecord.stage !== 'hub-pending') {
+    broadcastRecord = advance(broadcastRecord, 'hub-pending')
+    await ctx.upsert(broadcastRecord)
+  }
+
   const pollResult = await poll(
     (signal) => pollRelayStatusOnce(txHash, signal, record.meta.fromChainId),
-    { signal: ctx.signal, timeoutMs: pollBudgetMs(record) },
+    { signal: ctx.signal, timeoutMs: pollBudgetMs(record), intervalMs: RELAYER_STATUS_POLL_INTERVAL_MS },
   )
 
   if (pollResult.status === 'aborted') throw new Error('cancelled')
@@ -632,12 +648,11 @@ async function runGaslessSubmit(
 
   track('tx.relayer.confirmed', { id: record.id, kind: record.kind })
 
-  if (kmIsUnlocked()) {
-    void refreshShieldedBalances(kmGetWalletId()).catch(() => {})
-  }
-
-  const completed = advance(broadcastRecord, 'hub-confirmed', {
+  // Sync, then read the pool's actual protocol + relayer fees off the confirmed shield (#74), folded into the write
+  // that completes the record.
+  const actual = await recordedShieldFees(txHash)
+  const completed = patchMeta(advance(broadcastRecord, 'hub-confirmed', {
     sourceTxHash: txHash,
-  })
+  }), actual)
   await ctx.upsert(completed)
 }

@@ -1,12 +1,12 @@
-// ABOUTME: Send/Withdraw complete step — frost card with left-aligned "USDC send/unshield confirmed" title + big mono amount, shared TransferReviewSummary (with date/time), and explorer/dashboard CTAs.
-// ABOUTME: Mirrors ShieldCompleteStep — no divider between the summary card and the button row.
+// ABOUTME: Send/Withdraw complete step — confirm layout with TransferReviewSummary + explorer/dashboard CTAs.
+// ABOUTME: Presentation via design ConfirmedScreenLayout (armada-app SendConfirmedScreen parity).
 
-import { Button, modalStepBodyEnter, modalActionRowEnter } from '@/design'
+import { ConfirmedScreenLayout } from '@/design'
+import type { CctpFeeFigure } from '@/lib/fees/txFigures'
 import { TransferReviewSummary } from './TransferReviewSummary'
 import { formatUsdcPlain } from '@/lib/format'
 import { isShieldedAddress } from '@/lib/address'
 import type { SendFlowVariant } from './SendRecipientStep'
-import styles from './SendCompleteStep.module.css'
 
 export interface SendCompleteStepProps {
   variant: SendFlowVariant
@@ -15,8 +15,11 @@ export interface SendCompleteStepProps {
   armadaAddress?: string
   /** Gross amount sent/withdrawn (raw 6-decimal USDC) — shown full-precision in the amount block. */
   amount: bigint
-  /** Inclusive Fee total — broadcaster + protocol + CCTP. Rendered as "—" when null. */
+  /** The fee charged on top of the amount — the relayer fee (+ any protocol fee). Rendered as "—" when null. */
   fee: bigint | null
+  /** A cross-chain unshield's CCTP fee — taken from the amount in transit, so not part of `fee` or the total — and
+   *  whether it's still the estimate. Shown on its own row; the Fees row then reads "Relayer fee". */
+  cctpFee?: CctpFeeFigure | null
   /** USDC deducted from the user's shielded balance — `amount + fee`; the summary's Total row. */
   totalDeducted: bigint
   /** Destination chain name — shown on the summary's Network row for public (0x) recipients. */
@@ -37,6 +40,7 @@ export function SendCompleteStep({
   armadaAddress,
   amount,
   fee,
+  cctpFee = null,
   totalDeducted,
   networkName,
   recipientWalletProvider,
@@ -53,46 +57,24 @@ export function SendCompleteStep({
         : 'USDC sent successfully'
 
   return (
-    <div className={styles.root}>
-      <div className={`${styles.body} ${modalStepBodyEnter}`}>
-        <div className={styles.titleBlock}>
-          <h1 className={styles.title}>{title}</h1>
-          <div className={styles.amountRow}>
-            <span className={styles.amountValue}>{formatUsdcPlain(amount)}</span>
-          </div>
-        </div>
-
-        <TransferReviewSummary
-          recipient={recipient}
-          armadaAddress={armadaAddress}
-          fee={fee}
-          totalDeducted={totalDeducted}
-          variant={variant}
-          networkName={networkName}
-          recipientWalletProvider={recipientWalletProvider}
-          confirmedAt={confirmedAt}
-        />
-      </div>
-
-      <div className={`${styles.buttonRow} ${modalActionRowEnter}`}>
-        <Button
-          variant="secondary"
-          size="lg"
-          label="View on explorer"
-          showIcon={false}
-          className={styles.cancelButton}
-          onClick={onViewExplorer}
-          disabled={!explorerUrl}
-        />
-        <Button
-          variant="primary"
-          size="lg"
-          label="Go to dashboard"
-          showIcon={false}
-          className={styles.confirmButton}
-          onClick={onGoToDashboard}
-        />
-      </div>
-    </div>
+    <ConfirmedScreenLayout
+      title={title}
+      amountLabel={formatUsdcPlain(amount)}
+      onViewExplorer={onViewExplorer}
+      onGoToDashboard={onGoToDashboard}
+      viewExplorerDisabled={!explorerUrl}
+    >
+      <TransferReviewSummary
+        recipient={recipient}
+        armadaAddress={armadaAddress}
+        fee={fee}
+        cctpFee={cctpFee}
+        totalDeducted={totalDeducted}
+        variant={variant}
+        networkName={networkName}
+        recipientWalletProvider={recipientWalletProvider}
+        confirmedAt={confirmedAt}
+      />
+    </ConfirmedScreenLayout>
   )
 }

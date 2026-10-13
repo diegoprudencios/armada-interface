@@ -3,16 +3,14 @@
 
 import { ethers } from 'ethers'
 import { keccak256, toBytes } from 'viem'
-import { getPublicClient, sendTransaction } from 'wagmi/actions'
-import { asTxError, waitForReceiptOrFail } from '@/lib/tx/receipt'
-import { simulateOrThrow } from '@/lib/tx/simulate'
+import { getPublicClient } from 'wagmi/actions'
+import { asTxError } from '@/lib/tx/receipt'
 import { classifyHandlerError } from '@/lib/tx/errors'
 import { throwIfForcedError } from '@/lib/tx/devForce'
 import { track } from '@/lib/telemetry'
 import { wagmiConfig } from '@/config/wagmi'
 import { loadDeployments } from '@/config/deployments'
 import { getChainById, getNetworkConfig } from '@/config/network'
-import { ensureChain } from '@/lib/network-switch'
 import { createProvider } from '@/lib/rpc'
 import {
   getWalletId as kmGetWalletId,
@@ -20,6 +18,8 @@ import {
 } from '@/lib/shielded/keyManager'
 import { refreshShieldedBalances } from '@/lib/shielded/sync'
 import { buildXchainUnshieldSdk } from '@/lib/shielded/unshield-xchain-sdk'
+import { encodeTxSelfMetadata } from '@/lib/shielded/selfMetadata'
+import { markSpendPendingForRecord, clearSpendPendingForTx, forgetSpendPlan } from '@/lib/shielded/pending-spend'
 import {
   extractCctpMessageFromReceipt,
   messageReceivedTopic,
@@ -42,10 +42,11 @@ type EthersScanLog = {
   topics: readonly string[]
   data: string
 }
-import { advance, markFailed, markWaiting, patchArtifacts } from '@/lib/tx/reducer'
+import { advance, markFailed, markWaiting, patchArtifacts, patchMeta } from '@/lib/tx/reducer'
 import { recordBroadcastHash } from '@/lib/tx/broadcast'
-import { poll, pollBudgetMs, pollRelayStatusOnce } from '@/lib/tx/poller'
+import { poll, pollBudgetMs, pollRelayStatusOnce, RELAYER_STATUS_POLL_INTERVAL_MS } from '@/lib/tx/poller'
 import { scanCctpDeliveryWindow, matchesXchainDelivery } from './scan'
+import { deliveredCctpFee, deliveredUnshieldMeta } from './reconcile'
 import { createProofProgressWriter } from '@/lib/tx/progress'
 import type { StageHandler } from '@/lib/tx/executor'
 import type { TxError, TxRecord } from '@/lib/tx/types'
@@ -81,8 +82,9 @@ function deliveryNonce(recordId: string): `0x${string}` {
  */
 export const unshieldXchainHandler: StageHandler<'unshield-xchain'> = {
   kind: 'unshield-xchain',
-  // Iris/client polling can be resumed; pre-hub-receipt stages can't (proof + onchain submit).
-  resumableFrom: ['submit-relayer', 'iris-attestation-pending'],
+  // Iris/client polling + its collapsed tail stages can be resumed; pre-hub-receipt stages can't
+  // (proof + onchain submit).
+  resumableFrom: ['submit-relayer', 'iris-attestation-pending', 'iris-attestation-ready', 'client-mint-pending'],
 
   async run(record, ctx) {
     try {
@@ -100,13 +102,20 @@ export const unshieldXchainHandler: StageHandler<'unshield-xchain'> = {
           await ctx.upsert(advance(record, 'iris-attestation-pending'))
           return
         case 'iris-attestation-pending':
+        // The collapsed tail stages are normally walked through synchronously inside
+        // runWaitForDelivery, but resume (#4) can re-enter run() with the record parked at one of
+        // them. Re-enter the delivery wait — it re-polls (idempotent: finds the already-delivered
+        // message) and walks to terminal — rather than falling through to a no-op that would
+        // busy-loop the chain. (client-mint-confirmed is terminal, so the loop never calls run() there.)
+        case 'iris-attestation-ready':
+        case 'client-mint-pending':
           await runWaitForDelivery(record, ctx)
           return
-        // The remaining stages (iris-attestation-ready / client-mint-pending /
-        // client-mint-confirmed) are advanced through inside runWaitForDelivery. If we end up
-        // here it's a resume from a partially-completed delivery and we're already terminal.
       }
     } catch (err) {
+      // Nothing was broadcast on this path (or the stash was already consumed at broadcast) — drop any
+      // stashed plans (#55) rather than keep them for the session.
+      forgetSpendPlan(record.id)
       if (ctx.signal.aborted) return
       const failed = markFailed(record, classifyHandlerError(err, 'Cross-chain withdraw failed.', record.artifacts.sourceTxHash, getNetworkConfig().hub.chainId))
       await ctx.upsert(failed)
@@ -114,13 +123,16 @@ export const unshieldXchainHandler: StageHandler<'unshield-xchain'> = {
   },
 }
 
-/** A6 — null when wallet-override, otherwise the broadcaster context from meta. */
+/**
+ * The broadcaster fee note context — always present (spends are relayer-submitted; #23). The plan pays
+ * the PER-PROOF fee; `broadcasterFeeAmount` is the reviewed total, which can include small change the SDK
+ * folds into the fee. Records from before review-time planning carry no per-proof fee — it equals the total.
+ */
 function broadcasterFeeFromRecord(
   record: TxRecord<'unshield-xchain'>,
-): { amount: bigint; recipientAddress: string } | null {
-  if (record.meta.useWalletOverride) return null
+): { amount: bigint; recipientAddress: string } {
   return {
-    amount: record.meta.broadcasterFeeAmount,
+    amount: record.meta.broadcasterFeePerProof ?? record.meta.broadcasterFeeAmount,
     recipientAddress: record.meta.broadcasterShieldedAddress,
   }
 }
@@ -159,18 +171,34 @@ async function runBuildProof(
   // atomicCrossChainUnshield, and stash the calldata so submit-relayer dispatches it without
   // re-proving. Survives a reload (persisted in the record). The CCTP destinationCaller is pinned to
   // remoteHookRouters[destinationDomain] by PrivacyPool (issue #64) — it is not passed here.
-  const { to, data } = await buildXchainUnshieldSdk({
+  // Persist the recoverable bucket-C fields (#44) in the spend's change note so a fresh scan recovers
+  // them even after local storage is cleared.
+  const selfMetadata = encodeTxSelfMetadata({
+    feeCacheId: record.meta.feeCacheId,
+  })
+  // `maxTotalFee` is the fee the user reviewed: the build refuses to charge more (the wallet's notes may
+  // have changed since review, so the change can no longer be folded into the fee).
+  const { to, data, totalFee } = await buildXchainUnshieldSdk({
     amount: record.meta.amount,
     broadcasterFee: broadcasterFeeFromRecord(record),
+    maxTotalFee: record.meta.broadcasterFeeAmount,
     privacyPoolAddress: privacyPoolAddress as `0x${string}`,
     finalRecipient: record.meta.recipient as `0x${string}`,
     destinationDomain,
     maxFee,
     uniqueNonce: deliveryNonce(record.id), // issue #287 — unique per-tx marker echoed into the CCTP hookData
     onProgress: progress.write,
+    // `recordId` lets the builder stash the plan so submit can mark its inputs pending after broadcast (#55).
+    recordId: record.id,
+    ...(selfMetadata ? { selfMetadata } : {}),
   })
   if (ctx.signal.aborted) throw new Error('cancelled')
-  await ctx.upsert(advance(progress.latest(), 'submit-relayer', { unshieldTx: { to, data, value: '0' } }))
+  const built = advance(progress.latest(), 'submit-relayer', { unshieldTx: { to, data, value: '0' } })
+  // Record the fee actually charged (≤ the reviewed fee) so the receipt shows what was paid.
+  const charged = totalFee === record.meta.broadcasterFeeAmount
+    ? built
+    : { ...built, meta: { ...built.meta, broadcasterFeeAmount: totalFee } }
+  await ctx.upsert(charged)
 }
 
 async function runSubmitAndBurn(
@@ -187,55 +215,6 @@ async function runSubmitAndBurn(
   // survives a reload — no re-proving on resume. Only the broadcast itself is guarded against
   // re-entry via the sourceTxHash idempotency check below. (P0-1)
   const existingHash = record.artifacts.sourceTxHash
-
-  // A6 wallet-override path — submit the wrapper calldata via the user's EVM wallet. The
-  // CCTP-message extraction + destination polling are identical to the relayer path; the only
-  // difference is the source of the hub-side tx hash.
-  if (record.meta.useWalletOverride) {
-    // Idempotency guard (P0-1): never re-broadcast a hub burn we already sent. On re-entry skip
-    // to the receipt wait + CCTP extraction for the known hash.
-    let userHash = existingHash
-    let broadcastRecord = record
-    if (!userHash) {
-      await ensureChain(hubChainId)
-      if (ctx.signal.aborted) throw new Error('cancelled')
-      // S-M8: pre-flight simulate so an on-chain revert surfaces as a typed PRE_FLIGHT_REVERT
-      // ("nothing was sent") instead of MetaMask's opaque 30M-gas-fallback "gas limit too high".
-      const sender = record.walletContext.evmAddress
-      if (sender) {
-        await simulateOrThrow({
-          to: unshieldTx.to,
-          data: unshieldTx.data,
-          value: BigInt(unshieldTx.value),
-          account: sender as `0x${string}`,
-          chainId: hubChainId,
-        })
-        if (ctx.signal.aborted) throw new Error('cancelled')
-      }
-      userHash = await sendTransaction(wagmiConfig, {
-        to: unshieldTx.to,
-        data: unshieldTx.data,
-        value: BigInt(unshieldTx.value),
-        chainId: hubChainId,
-      })
-      const broadcast = await recordBroadcastHash(record, userHash, ctx)
-      if (broadcast.dismissed) return
-      broadcastRecord = broadcast.record
-    }
-    await waitForReceiptOrFail({ hash: userHash, signal: ctx.signal, chainId: hubChainId })
-    await extractCctpRefAndAdvance({
-      ctx,
-      record: broadcastRecord,
-      txHash: userHash,
-      hubChainId,
-      messageTransmitter: deployments.hub.cctp.messageTransmitter as `0x${string}`,
-      destChainId: record.meta.toChainId,
-    })
-    if (kmIsUnlocked()) {
-      void refreshShieldedBalances(kmGetWalletId()).catch(() => {})
-    }
-    return
-  }
 
   // Hand the wrapper calldata to the relayer. Pre-submit pipeline validates the selector
   // (atomicCrossChainUnshield → A5 addition) and decrypts the embedded broadcaster output against
@@ -278,13 +257,16 @@ async function runSubmitAndBurn(
     const broadcast = await recordBroadcastHash(record, txHash, ctx)
     if (broadcast.dismissed) return
     broadcastRecord = broadcast.record
+    // #55: hold this spend's inputs so a rapid follow-up spend won't reselect them before the
+    // Nullified event is scanned. No-op on resume (no stashed plan). Best-effort.
+    await markSpendPendingForRecord(record.id, txHash)
   }
 
   // Poll the relayer's /status until terminal. Same shape as unshield-local — the generic poll
   // loop handles jittered backoff + abort propagation.
   const pollResult = await poll(
     (signal) => pollRelayStatusOnce(txHash, signal, hubChainId),
-    { signal: ctx.signal, timeoutMs: pollBudgetMs(record) },
+    { signal: ctx.signal, timeoutMs: pollBudgetMs(record), intervalMs: RELAYER_STATUS_POLL_INTERVAL_MS },
   )
 
   if (pollResult.status === 'aborted') throw new Error('cancelled')
@@ -305,6 +287,9 @@ async function runSubmitAndBurn(
   }
   if (final.status === 'failed') {
     track('tx.relayer.rejected', { id: record.id, kind: record.kind, errorCode: 'EXECUTION_FAILED' })
+    // #55: the hub burn reverted → its inputs were NOT nullified on-chain, so release the optimistic
+    // hold now instead of waiting out the TTL, freeing the notes for the next spend.
+    await clearSpendPendingForTx(txHash)
     const error: TxError = {
       code: 'TX_REVERTED',
       message: final.error ?? 'Relayer-broadcast hub burn reverted on chain.',
@@ -335,8 +320,7 @@ async function runSubmitAndBurn(
 /**
  * Hub-side completion: fetch the tx receipt from the wagmi public client, extract the CCTP
  * MessageSent event from the logs, snapshot the destination chain's current block height, and
- * advance the record to `hub-burn-confirmed`. Identical for both the relayer-mediated path (A5)
- * and the wallet-override path (A6) — they only differ in the source of the txHash.
+ * advance the record to `hub-burn-confirmed`.
  */
 async function extractCctpRefAndAdvance(args: {
   ctx: Parameters<typeof unshieldXchainHandler.run>[1]
@@ -431,7 +415,8 @@ async function runWaitForDelivery(
   // record fails fast rather than hanging a tick) and emits tx.budget.tight when the floor engages.
   const pollTimeoutMs = pollBudgetMs(record)
 
-  const result = await poll<`0x${string}`>(
+  // What the poll finds: the destination mint tx, and Circle's actual CCTP fee when the delivery reports it.
+  const result = await poll<{ destTxHash: `0x${string}`; cctpFeeActual: bigint | undefined }>(
     async (signal) => {
       if (signal.aborted) return null
       // T-M7 Option B primary: ask the relayer for authoritative CCTP delivery status (it performs
@@ -441,7 +426,9 @@ async function runWaitForDelivery(
       const messageHash = record.artifacts.messageHash
       if (messageHash) {
         const relayed = await fetchCctpDeliveryStatus(messageHash, signal)
-        if (relayed.kind === 'delivered') return relayed.destTxHash
+        if (relayed.kind === 'delivered') {
+          return { destTxHash: relayed.destTxHash, cctpFeeActual: deliveredCctpFee({ feeExecuted: relayed.feeExecuted }) }
+        }
         if (relayed.kind === 'pending') return null
         if (relayed.kind === 'failed') {
           throw asTxError({
@@ -485,7 +472,15 @@ async function runWaitForDelivery(
         scanFromBlock,
         maxLogRange,
       })
-      if (outcome.kind === 'match') return outcome.txHash
+      if (outcome.kind === 'match') {
+        // The matched MessageReceived carries the BurnMessage, whose `feeExecuted` is the actual CCTP fee.
+        let messageBody: `0x${string}` | undefined
+        try {
+          messageBody = MESSAGE_RECEIVED_IFACE.parseLog({ topics: Array.from(outcome.log.topics), data: outcome.log.data })
+            ?.args.messageBody as `0x${string}` | undefined
+        } catch { /* unparseable — the record keeps its estimate */ }
+        return { destTxHash: outcome.txHash, cctpFeeActual: deliveredCctpFee({ messageBody }) }
+      }
       if (outcome.kind === 'no-new-blocks') return null
 
       // Advance the cursor and persist so a crash + resume starts where we left off rather than
@@ -514,7 +509,7 @@ async function runWaitForDelivery(
     // the already-terminal record.
     return
   }
-  if (result.status !== 'done') {
+  if (result.status !== 'done' || result.value === undefined) {
     // Timeout: we know the sourceTxHash and that the relayer/Iris haven't delivered within the
     // budget. The on-chain mint may still happen later — the user should check the destination
     // explorer. POLL_TIMEOUT category surfaces that ambiguity in the UI copy.
@@ -545,7 +540,10 @@ async function runWaitForDelivery(
     // intent is clearer when we don't even attempt it.
     if (ctx.signal.aborted) return
     const next = skipStages[i]!
-    cursor = advance(cursor, next, next === 'client-mint-confirmed' ? { destTxHash: result.value } : {})
+    cursor = advance(cursor, next, next === 'client-mint-confirmed' ? { destTxHash: result.value.destTxHash } : {})
+    // The actual CCTP fee replaces the review-time estimate in the SAME write that reaches the terminal stage, so the
+    // Complete screen renders it directly (no estimate-then-snap flash). Unknown → the estimate stays, marked "≈".
+    if (next === 'client-mint-confirmed') cursor = patchMeta(cursor, deliveredUnshieldMeta(result.value.cctpFeeActual))
     await ctx.upsert(cursor)
     // Only delay before the next non-terminal hop; no point pausing before terminal.
     if (i < skipStages.length - 1) {

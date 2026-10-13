@@ -32,13 +32,15 @@ src/
 ├── App.tsx                  installs visibility listener + hydrates tx history; renders <AppLayout>
 ├── index.css                @import tailwindcss + ./design/styles tokens.css + global.css
 ├── design/                  vendored design system (@/design) — primitives + tokens/typography CSS; severed from @armada/ui
+│   ├── tokens/              Token Studio JSON (armada-tokens.json) — edit semantic.typography here, then `npm run tokens:typography`
+│   └── styles/              tokens.css (hand-maintained colors) + generated typography.css; also fonts.css, mobileLayout.css
 ├── config/                  env-driven config — network, wagmi, deployments, relayer
 ├── lib/                     pure logic, no React (rpc, cache, format, revert, wagmi-adapter, telemetry, relayer, cctp)
 │   ├── shielded/            @armada/sdk wrappers (wallet, keyManager, sdk-read, sdk-prover, sync, balance-bus, network, artifacts) — stock engine fully removed
 │   └── tx/                  lifecycle model — types, lifecycles, reducer, storage, poller
 ├── state/                   Jotai atoms (tx, wallet, fees, visibility, ui)
 ├── hooks/                   per-concern hooks (useWallet, useShieldedWallet, useBalances, useYieldRate, useFees, useTx, useTxHistory, useTabVisible)
-├── components/              AppLayout, WalletConnector, plus subfolders for each feature (dashboard/, shield/, yield/, payments/, tx/, settings/) — payments/ is the shared Send/Withdraw flow
+├── components/              AppLayout, WalletConnector, plus subfolders for each feature (dashboard/, shield/, yield/, payments/, consolidate/, tx/, settings/) — payments/ is the shared Send/Withdraw flow
 └── pages/                   Dashboard, Debug, AddressBook, PayViaLinkLanding (Settings is a modal)
 ```
 
@@ -50,7 +52,7 @@ src/
 - **No typography Tailwind classes app-wide.** `text-xs`/`font-*`/`tracking-*`/`leading-*`/`uppercase` etc. are forbidden — typography flows from the body baseline + `@/design` CSS Modules. Layout utilities (`flex`, `grid`, `mx-auto`, `pt-20`, color tokens) are fine.
 - **TS strict + `noUncheckedIndexedAccess`.** No `any`, no `as any`. If a type is opaque (e.g. wagmi internals), narrow at the boundary.
 - **Tx executor lives at module scope, not React scope.** `lib/tx/executor.ts` initialises via `startEngine()` (called once from `App.tsx`). Hooks dispatch `executeTx(id)` / `cancelTx(id)`; they don't orchestrate.
-- **Single-leader execution.** Only the tab holding the `armada-tx-executor` `navigator.locks` lock runs handlers. Other tabs are passive observers. v1 has no follower-side live sync — opening multiple tabs means only the first is active.
+- **Single-leader execution.** Only the tab holding the `armada-tx-executor` `navigator.locks` lock runs handlers. Other tabs are passive observers. v1 has no follower-side live sync — opening multiple tabs means only the first is active. In practice a second tab **can't run at all**: the `@armada/sdk` read instance enforces one scan DB per origin (a second `IndexedDBStorageAdapter` throws `StorageConflictError`), so a second tab is caught and shown the full-screen `SingleTabGate` ("already open in another tab") instead of a broken shell (`anotherTabActiveAtom`, set in `sdk-read.ts::ensureInstance`).
 - **Polling goes through React Query.** All HTTP and RPC reads that fit a request/response shape use `useQuery` / `useQueries`, configured with `refetchIntervalInBackground: false` so hidden tabs don't burn quota. Don't write bespoke `setInterval` pollers.
 - **`eth_getLogs` is always bounded.** Never query from genesis or with an unbounded `toBlock` on a public RPC. Either chunk via `lib/events/getLogsChunked` or scan one bounded window per poll tick (see `features/unshield-xchain/scan.ts`). The per-network cap lives in `NetworkConfig.maxLogRange` (5_000 on sepolia, 100_000 on local).
 - Per-folder CLAUDE.md captures folder-specific conventions.
@@ -59,19 +61,19 @@ src/
 
 ```bash
 # From repo root
-npm install --legacy-peer-deps        # if dependencies changed
+npm install                           # if dependencies changed
 npm run armada:interface              # → http://localhost:5176
 
 # Or equivalently:
 npm run dev --workspace=@armada/interface
 
-# Typecheck only
+# Typecheck only (app and test files)
 npm run typecheck --workspace=@armada/interface
 ```
 
 For local mode (`VITE_NETWORK=local` — default), three Anvil chains must be running on `:8545` / `:8546` / `:8547`. Use the existing `npm run chains` + `npm run setup` from the repo root.
 
-For Sepolia, set `VITE_NETWORK=sepolia` and ensure manifest files exist in `deployments/` (`privacy-pool-hub-sepolia.json`, `privacy-pool-client-sepolia.json`, `privacy-pool-clientB-sepolia.json`).
+For Sepolia, set `VITE_NETWORK=sepolia` and ensure manifest files exist in `deployments/` (`privacy-pool-hub-sepolia.json`, `privacy-pool-client1-sepolia.json`, `privacy-pool-client2-sepolia.json`).
 
 ## Duplicated utilities
 
@@ -79,13 +81,15 @@ For Sepolia, set `VITE_NETWORK=sepolia` and ensure manifest files exist in `depl
 
 ## Tx lifecycle model — required reading
 
-The central design is in `src/lib/tx/types.ts`, `src/lib/tx/lifecycles.ts`, and `src/lib/tx/executor.ts`. Every transaction kind (`shield`, `unshield-local`, `unshield-xchain`, `transfer-shielded`, `yield-deposit`, `yield-withdraw`, `payment-xchain`) declares its own stage sequence with a per-kind `maxDurationMs` + `retry` policy. Records carry an `executionState` (lifecycle position: `pending | active | waiting | retrying | completed | failed | expired | cancelled`) separate from the protocol `stage`. The same `useTx()` hook handles all kinds; the same future `<TxLifecycleStepper>` component renders any record. Adding a new kind is a 3-file change:
+The central design is in `src/lib/tx/types.ts`, `src/lib/tx/lifecycles.ts`, and `src/lib/tx/executor.ts`. Every transaction kind (`shield`, `unshield-local`, `unshield-xchain`, `transfer-shielded`, `yield-deposit`, `yield-withdraw`, `consolidate`, `payment-xchain`) declares its own stage sequence with a per-kind `maxDurationMs` + `retry` policy. Records carry an `executionState` (lifecycle position: `pending | active | waiting | retrying | completed | failed | expired | cancelled`) separate from the protocol `stage`. The same `useTx()` hook handles all kinds; the same future `<TxLifecycleStepper>` component renders any record. Adding a new kind is a 3-file change:
 
 1. Extend the `TxKind` union and add a stage union in `lib/tx/types.ts`.
 2. Add a lifecycle entry in `lib/tx/lifecycles.ts`.
 3. (Optional) Add custom rendering in `components/tx/`.
 
 This model fixes the crowdfund-committer's `useTransactionFlow` single-tx limitation — multi-instance, persistent, cross-chain-aware.
+
+**Displayed figures:** what each kind's amount / fee / total rows mean on Review, Confirm, the Activity row and receipt, and a receipt recovered from chain history — and which of them must agree — is specified in `specs/TX_VALUES.md`. A change to how a figure is computed or shown updates its row there in the same PR (applied to every sibling flow).
 
 ## What's intentionally NOT in the scaffold
 

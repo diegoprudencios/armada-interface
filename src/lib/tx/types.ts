@@ -10,6 +10,7 @@ export type TxKind =
   | 'transfer-shielded-received'
   | 'yield-deposit'
   | 'yield-withdraw'
+  | 'consolidate'
 
 /**
  * Execution lifecycle state — separate from the protocol stage so they don't
@@ -70,6 +71,7 @@ export function historySortTime(record: {
 export type StageShield =
   | 'build-proof'
   | 'submit-relayer'
+  | 'hub-pending'
   | 'hub-confirmed'
 
 /**
@@ -93,6 +95,7 @@ export type StageShieldXchain =
 export type StageUnshieldLocal =
   | 'build-proof'
   | 'submit-relayer'
+  | 'hub-pending'
   | 'hub-confirmed'
 
 export type StageUnshieldXchain =
@@ -107,11 +110,12 @@ export type StageUnshieldXchain =
 export type StageTransferShielded =
   | 'build-proof'
   | 'submit-relayer'
+  | 'hub-pending'
   | 'hub-confirmed'
 
 /**
  * Synthetic received-transfer kind. These records are not authored by the user — they're
- * reconstructed from chain via `getWalletTransactionHistory` when another wallet shields to our
+ * reconstructed from chain via the `@armada/sdk` wallet's `history()` when another wallet shields to our
  * 0zk address. There's no proof/submit/confirm flow we drove, so the lifecycle collapses to a
  * single terminal `observed` stage: by the time we synthesize the record, the commitment is
  * already on the merkle tree.
@@ -121,11 +125,20 @@ export type StageReceived = 'observed'
 export type StageYieldDeposit =
   | 'build-proof'
   | 'submit-relayer'
+  | 'hub-pending'
   | 'hub-confirmed'
 
 export type StageYieldWithdraw =
   | 'build-proof'
   | 'submit-relayer'
+  | 'hub-pending'
+  | 'hub-confirmed'
+
+/** Note consolidation (armada-sdk #98): relayer-submitted like a private send. */
+export type StageConsolidate =
+  | 'build-proof'
+  | 'submit-relayer'
+  | 'hub-pending'
   | 'hub-confirmed'
 
 export type TxStage =
@@ -137,6 +150,7 @@ export type TxStage =
   | StageReceived
   | StageYieldDeposit
   | StageYieldWithdraw
+  | StageConsolidate
 
 /* Per-kind stage map — used to constrain `TxRecord<K>['stage']` to legal values. */
 export type StageFor<K extends TxKind> =
@@ -148,6 +162,7 @@ export type StageFor<K extends TxKind> =
   : K extends 'transfer-shielded-received' ? StageReceived
   : K extends 'yield-deposit' ? StageYieldDeposit
   : K extends 'yield-withdraw' ? StageYieldWithdraw
+  : K extends 'consolidate' ? StageConsolidate
   : never
 
 /* Meta — input parameters captured at tx submit time. */
@@ -170,7 +185,7 @@ export interface MetaShield extends MetaCommon {
   fromChainId: number
   /**
    * Phase B3 — gasless mode flag. Frozen at submit-time by the modal based on (wrapper
-   * deployed for fromChainId AND relayer healthy AND user hasn't toggled wallet-override).
+   * deployed for fromChainId AND relayer healthy).
    *   - `true`  → handler signs an EIP-2612 permit + POSTs gaslessShield(...) calldata to the
    *     relayer; user pays the relayer's `shield` tier fee in USDC and no ETH gas.
    *   - `false` → handler does the existing direct path (user-signed approve + shield from the
@@ -179,8 +194,9 @@ export interface MetaShield extends MetaCommon {
   useGasless?: boolean
   /**
    * Phase B3 — USDC raw amount paid to the relayer's wrapper for gas reimbursement. Only set
-   * when `useGasless` is true. The permit signature authorises `amount + feeAmount` total; the
-   * wrapper splits `amount` to the pool and `feeAmount` to the relayer.
+   * when `useGasless` is true. The permit signature authorises `amount` — the total the user
+   * entered, fee included; the fee comes out of it: the user's note is `amount − feeAmount`, the
+   * relayer's fee note `feeAmount`.
    */
   feeAmount?: bigint
   /**
@@ -200,6 +216,16 @@ export interface MetaShield extends MetaCommon {
    * the old public-USDC fee. Only set when `useGasless` is true.
    */
   broadcasterShieldedAddress?: string
+  /**
+   * On-chain protocol shield fee (PrivacyPool's ~50 bps armadaTake) charged on the shielded note.
+   * Captured at submit-time from `useDisplayFees` so the receipt can subtract it — the note that
+   * lands is `amount - feeAmount - protocolFee`. Absent on records pre-dating this capture (the
+   * receipt treats absent as 0 and under-reports the fee for those, as it did before).
+   */
+  protocolFee?: bigint
+  /** True while `protocolFee` is the ~50 bps estimate (the fee module couldn't be read at review); cleared once the
+   *  handler reads the pool's actual fee off the confirmed shield. Absent → the fee module's own figure. */
+  protocolFeeIsEstimate?: boolean
 }
 
 export interface MetaShieldXchain extends MetaCommon {
@@ -208,7 +234,7 @@ export interface MetaShieldXchain extends MetaCommon {
   fromChainId: number
   /**
    * Phase B4 — gasless mode flag. Frozen at submit-time by the modal based on (client wrapper
-   * deployed for fromChainId AND relayer healthy AND user hasn't toggled wallet-override).
+   * deployed for fromChainId AND relayer healthy).
    *   - `true`  → handler signs an EIP-2612 permit on the source chain + POSTs
    *     gaslessCrossChainShield(...) calldata to the relayer; user pays the `shieldXchain`
    *     tier fee in USDC and no native gas on the source chain.
@@ -219,9 +245,9 @@ export interface MetaShieldXchain extends MetaCommon {
   useGasless?: boolean
   /**
    * Phase B4 — USDC raw amount paid to the relayer's wrapper for gas reimbursement on the
-   * source chain. Only set when `useGasless` is true. The permit signature authorises
-   * `amount + feeAmount` total; the wrapper splits `amount` into the CCTP burn and `feeAmount`
-   * to the relayer.
+   * source chain. Only set when `useGasless` is true. The permit signature authorises `amount` —
+   * the total the user entered, fee included; the fee comes out of it: the user's note is
+   * `amount − feeAmount`, the relayer's fee note `feeAmount`.
    */
   feeAmount?: bigint
   /**
@@ -241,11 +267,37 @@ export interface MetaShieldXchain extends MetaCommon {
    * hub at full value). Only set when `useGasless` is true.
    */
   broadcasterShieldedAddress?: string
+  /**
+   * On-chain protocol shield fee (PrivacyPool's ~50 bps armadaTake) charged on the hub-minted note.
+   * Captured at submit-time so the receipt can subtract it — the note that lands is
+   * `amount - feeAmount - protocolFee`. Absent on records pre-dating this capture. (Excludes the
+   * CCTP fast-fee, which is a separate line item — see `cctpFee`.)
+   */
+  protocolFee?: bigint
+  /** True while `protocolFee` is the ~50 bps estimate (the fee module couldn't be read at review); cleared once the
+   *  handler reads the pool's actual fee off the delivered shield. Absent → the fee module's own figure. */
+  protocolFeeIsEstimate?: boolean
+  /**
+   * CCTP fee deducted from the cross-chain mint on the hub — an estimate at submit-time, reconciled
+   * to the actual `feeExecuted` on confirmation (and on rescan, recovered from the hub MessageReceived).
+   * The note that lands is `amount - cctpFee - feeAmount - protocolFee`; `amount` is the true deposit.
+   */
+  cctpFee?: bigint
+  /**
+   * True while `cctpFee` is the review-time estimate; cleared once the actual `feeExecuted` replaces it, so every
+   * surface marks the fee (and the net) "≈" until then. Absent on records written before it existed — their
+   * `cctpFee`, if any, came from the reconcile, so it reads as the actual.
+   */
+  cctpFeeIsEstimate?: boolean
 }
 
 export interface MetaUnshieldLocal extends MetaCommon, MetaBroadcaster {
   /** EVM recipient on the hub chain. */
   recipient: string
+  /** The on-chain protocol unshield fee (taken from the unshielded amount): shown at review, or recovered
+   *  from the Unshield event on a rescan. Absent when there's none (Armada charges none today) and on
+   *  records written before it was stored. */
+  protocolFee?: bigint
 }
 
 export interface MetaUnshieldXchain extends MetaCommon, MetaBroadcaster {
@@ -253,6 +305,16 @@ export interface MetaUnshieldXchain extends MetaCommon, MetaBroadcaster {
   toChainId: number
   /** EVM recipient on the destination chain. */
   recipient: string
+  /** The on-chain protocol unshield fee: shown at review, or recovered from the Unshield event on a
+   *  rescan. Absent when there's none (Armada charges none today) and on older records. */
+  protocolFee?: bigint
+  /** The CCTP fast fee shown at review (taken from the destination mint) — an estimate; the actual fee is
+   *  only known on the destination chain. A chain-recovered record carries the same estimate, read back from
+   *  the burn's `maxFee`. Absent on older records. */
+  cctpFee?: bigint
+  /** True while `cctpFee` is an estimate (always, until the actual fee is read at delivery). Absent on records
+   *  written before it existed — their `cctpFee` was always the review-time estimate, so it reads as one. */
+  cctpFeeIsEstimate?: boolean
 }
 
 /**
@@ -260,48 +322,82 @@ export interface MetaUnshieldXchain extends MetaCommon, MetaBroadcaster {
  * embeds these EXACT values; the relayer's server-side verifier (Phase A2) rejects requests
  * whose decrypted broadcaster output doesn't match. Frozen for the record's lifetime — the
  * cacheId already gates against the relayer rotating the schedule mid-flight.
- *
- * A6 — when `useWalletOverride: true` the handler skips the broadcaster path entirely: the proof
- * is built with `broadcasterFee: null`, the tx is submitted via the user's EVM wallet, and the
- * broadcasterFeeAmount / broadcasterShieldedAddress fields are recorded for history but ignored
- * by the proof builder. The flag is frozen on the record at submit-time so a session-level
- * preference flip mid-flight doesn't strand the handler.
  */
 interface MetaBroadcaster {
-  /** USDC raw amount paid to the relayer's broadcaster output. */
+  /** USDC raw amount paid to the relayer's broadcaster output(s) — the spend's TOTAL fee (see below). */
   broadcasterFeeAmount: bigint
+  /**
+   * The relayer's quoted fee PER PROOF. `broadcasterFeeAmount` is then the TOTAL: the fee the user reviewed,
+   * then the fee actually charged once build-proof plans it — one per-proof fee per proof for a multi-proof
+   * spend (a fragmented wallet's split send, a merge), or one plus a small change the SDK folded into it.
+   * Absent on records written before spends were planned at review, and on a yield withdrawal (its fee is
+   * taken from the redeemed proceeds, not a note), where the per-proof fee equals `broadcasterFeeAmount`.
+   */
+  broadcasterFeePerProof?: bigint
   /** Relayer's shielded (`0zk`) address that the broadcaster output pays. */
   broadcasterShieldedAddress: string
-  /**
-   * A6 wallet-override escape hatch. When true, handler builds the proof with `broadcasterFee:
-   * null` and submits via the user's EVM wallet (writeContract / sendTransaction) instead of
-   * POSTing to `/relay`. Defaults to false (relayer path) for records created before A6.
-   */
-  useWalletOverride?: boolean
 }
 
 export interface MetaTransferShielded extends MetaCommon, MetaBroadcaster {
   /** 0zk recipient. */
   recipient: string
+  /**
+   * Plaintext memo the sender attached to the recipient's note. Recovered from the sent output on a
+   * chain rescan (`sentOutputs[].memo`); absent when no memo was sent (or on pre-capture records).
+   */
+  memoText?: string
 }
 
 /**
  * Meta for a synthetic received transfer. Deliberately does NOT extend `MetaCommon` — a received
  * transfer carries no fee (we didn't author it, so there's no `feeCacheId` to attach). The sender
- * is private by Railgun's design and not recoverable, so we only keep the amount + any plaintext
- * memo the sender chose to attach.
+ * is private by Railgun's design unless they CHOSE to disclose their 0zk, in which case the SDK
+ * recovers it (`senderShieldedAddress`); otherwise only the amount + any plaintext memo survive.
  */
 export interface MetaTransferShieldedReceived {
   /** USDC raw amount (6 decimals) credited to our shielded balance. */
   amount: bigint
   /** Optional plaintext memo the sender attached (`memoText` on the SDK history item). */
   memoText?: string
+  /** Sender's 0zk address — present only when the sender opted to disclose it (SDK
+   *  `entry.senderShieldedAddress`); the sender is otherwise anonymous by design. */
+  senderShieldedAddress?: string
 }
 
-export type MetaYieldDeposit = MetaCommon & MetaBroadcaster
-export interface MetaYieldWithdraw extends MetaCommon, MetaBroadcaster {
+/** Net vault APY (basis points) at submit-time — surfaces the "Estimated APY" row on the receipt.
+ *  Recovered on rescan via the spend's self-metadata (armada-sdk #88 lever 3), which rides on the change note: a
+ *  deposit that left none (Max, fold-in) can't carry it. A withdrawal's change note is a share note — the SDK carries
+ *  its self-metadata onto the USDC leg (armada-sdk #113) — so only a full withdrawal (no share change) has none. */
+interface MetaYieldApy {
+  apyBps?: bigint
+}
+export type MetaYieldDeposit = MetaCommon & MetaBroadcaster & MetaYieldApy
+export interface MetaYieldWithdraw extends MetaCommon, MetaBroadcaster, MetaYieldApy {
   /** Yield share amount to redeem; `amount` is the expected USDC output. */
   shares: bigint
+  /**
+   * True while `amount` is the typed (quote-time) estimate; cleared once it's reconciled to the actual redeemed gross
+   * (by the handler, or by history recovery confirming the tx), so every surface marks it "≈" until then. Absent on
+   * records written before it existed — read as the reconciled actual.
+   */
+  amountIsEstimate?: boolean
+}
+
+/**
+ * Note consolidation (armada-sdk #98): merges one token's notes into fewer notes the wallet owns. No value
+ * leaves the wallet except the relayer fee, so `amount` is always 0n and the total deducted is
+ * `broadcasterFeeAmount` (USDC) — which keeps the fee-on-top math and the balance ledger right.
+ */
+export interface MetaConsolidate extends MetaCommon, MetaBroadcaster {
+  /** The token merged (USDC or vault shares). The fee is always USDC. On a record recovered from chain
+   *  this is the USDC fee leg's token (the scan can't see which token was merged). */
+  tokenAddress: `0x${string}`
+  /** The merged token's display name at submit ("USDC", "Vault shares"). Absent on recovered records. */
+  tokenSymbol?: string
+  /** How many of the token's notes the merge spends, and how many it leaves in their place. Absent on
+   *  records recovered from chain (the scan sees the fee leg, not the note counts). */
+  notesMerged?: number
+  notesCreated?: number
 }
 
 export type MetaFor<K extends TxKind> =
@@ -313,6 +409,7 @@ export type MetaFor<K extends TxKind> =
   : K extends 'transfer-shielded-received' ? MetaTransferShieldedReceived
   : K extends 'yield-deposit' ? MetaYieldDeposit
   : K extends 'yield-withdraw' ? MetaYieldWithdraw
+  : K extends 'consolidate' ? MetaConsolidate
   : never
 
 /* Artifacts — opaque outputs accumulated as stages complete. */
@@ -354,6 +451,10 @@ export type TxErrorCode =
   | 'DUPLICATE_TX'
   | 'CANCELLED'
   | 'DISMISSED'
+  // The executor's chain-loop no-progress backstop tripped: a handler's `run()` returned without
+  // advancing the stage, parking at `waiting`, or terminating — which would busy-loop the chain.
+  // The record is failed to break the loop, but the tx MAY have completed (indeterminate).
+  | 'STUCK'
   | 'OTHER'
 
 /**
@@ -364,6 +465,17 @@ export interface TxError {
   code: TxErrorCode
   message: string
   txHash?: `0x${string}`
+  /**
+   * An in-app fix the error screen can offer. `merge-notes`: the wallet's notes were too fragmented for
+   * the spend's circuit shape — merging them (a `consolidate` tx) unblocks it.
+   */
+  remedy?: 'merge-notes'
+  /**
+   * The `@armada/sdk` `ArmadaError` code this failure was classified from, when it came from the SDK.
+   * Several SDK codes share one `code` (e.g. PRE_FLIGHT_REVERT), so failure reporting uses this to tell
+   * an expected refusal from a bug or a broken prover (`failureReport.ts`).
+   */
+  sdkCode?: string
 }
 
 export interface ArtifactsCommon {
@@ -484,7 +596,7 @@ export interface ArtifactsYield extends ArtifactsCommon {
   /**
    * Withdraw-only (#312): the fee note's 16-byte hex `random`, captured at build-proof and sent on
    * the /relay request so the relayer can verify the fee is shielded to itself. Absent on deposit /
-   * wallet-override / fee-less redeem.
+   * fee-less redeem.
    */
   feeShieldRandom?: string
 }
@@ -496,6 +608,12 @@ export interface ArtifactsYield extends ArtifactsCommon {
  * & ArtifactsXchain` so the manifest is explicit and easy to read.
  */
 export interface ArtifactsShieldXchain extends ArtifactsXchain {
+  /**
+   * A record recovered from chain: its hub mint's CCTP message body. The hook data inside carries the authored shield
+   * request's marker (`shieldRequest.encryptedBundle[0]`), so recovery can find an authored record that never learned
+   * this hub mint (delivery still in flight, or it timed out) instead of adding a duplicate row (#77).
+   */
+  hubMessageBody?: `0x${string}`
   /** Hub PrivacyPool address — used by the hub mint detection to scope log queries. */
   privacyPoolAddress?: string
   /** Client PrivacyPoolClient address — used by submit-relayer to call crossChainShield. */
@@ -574,6 +692,19 @@ export interface ArtifactsUnshieldLocal extends ArtifactsCommon {
   }
 }
 
+export interface ArtifactsConsolidate extends ArtifactsCommon {
+  /**
+   * The consolidation's `transact([...])` calldata built during build-proof, so submit-relayer dispatches
+   * it without re-proving and it survives a reload. `value` is '0'; stringified for IDB. Mirrors
+   * `ArtifactsTransfer.transferTx`.
+   */
+  consolidateTx?: {
+    to: `0x${string}`
+    data: `0x${string}`
+    value: string
+  }
+}
+
 export type ArtifactsFor<K extends TxKind> =
   K extends 'unshield-xchain' ? ArtifactsXchain
   : K extends 'unshield-local' ? ArtifactsUnshieldLocal
@@ -582,6 +713,7 @@ export type ArtifactsFor<K extends TxKind> =
   : K extends 'yield-deposit' ? ArtifactsYield
   : K extends 'yield-withdraw' ? ArtifactsYield
   : K extends 'transfer-shielded' ? ArtifactsTransfer
+  : K extends 'consolidate' ? ArtifactsConsolidate
   : ArtifactsCommon
 
 /* Ownership / session context — captured at submit. Required for history
@@ -617,6 +749,12 @@ export interface TxRecord<K extends TxKind = TxKind> {
   artifacts: Partial<ArtifactsFor<K>>
   walletContext: TxWalletContext
 }
+
+/**
+ * A tx a Review step is about to submit — its kind + the meta it will carry, before it has a lifecycle. Figures
+ * render from it exactly as from the stored record (`lib/fees/txFigures`), so Review shows what the record holds.
+ */
+export type TxDraft<K extends TxKind = TxKind> = { [P in K]: { kind: P; meta: MetaFor<P> } }[K]
 
 /* Lifecycle metadata — drives steppers, retry buttons, expiry rules. */
 

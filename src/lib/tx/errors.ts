@@ -7,6 +7,7 @@ import { decodeRevertData, extractRevertHex } from './revertSelectors'
 import { isUserRejection, isChainMismatchError } from '../errors'
 import { mapRevertToMessage } from '../revert'
 import { getChainById } from '@/config/network'
+import { SpendFeeIncreasedError } from '@/lib/shielded/spend-fee-error'
 import type { TxError } from './types'
 import type { RelayerErrorCode } from '@/config/relayer'
 
@@ -73,6 +74,10 @@ function classifyRelayerError(err: unknown): TxError | null {
  */
 function classifySdkError(err: unknown): TxError | null {
   if (!(err instanceof ArmadaError)) return null
+  return { ...sdkErrorToTxError(err), sdkCode: err.code }
+}
+
+function sdkErrorToTxError(err: ArmadaError): TxError {
   switch (err.code) {
     case 'ROOT_MISMATCH':
       return {
@@ -92,10 +97,24 @@ function classifySdkError(err: unknown): TxError | null {
         code: 'PRE_FLIGHT_REVERT',
         message: "This wallet is unlocked in view-only mode and can't spend. Unlock with your signature to send.",
       }
+    // Both mean the wallet's notes are too fragmented for the spend's circuit shape; merging them fixes it.
     case 'UNSUPPORTED_CIRCUIT_SHAPE':
       return {
         code: 'PRE_FLIGHT_REVERT',
-        message: "This transaction's shape isn't supported by the available circuits.",
+        message: 'Your balance is spread across too many small notes for this transaction. Merge your notes, then try again.',
+        remedy: 'merge-notes',
+      }
+    case 'TOO_FRAGMENTED':
+      return {
+        code: 'PRE_FLIGHT_REVERT',
+        message: 'This would spend too many of your small notes at once. Merge your notes, then try again.',
+        remedy: 'merge-notes',
+      }
+    case 'NOTHING_TO_CONSOLIDATE':
+      return {
+        code: 'PRE_FLIGHT_REVERT',
+        message:
+          "Nothing to merge — your notes are already as few as they can usefully be, or too small to be worth the fee.",
       }
     case 'ARTIFACT_INTEGRITY':
       return {
@@ -106,6 +125,13 @@ function classifySdkError(err: unknown): TxError | null {
       return {
         code: 'PRE_FLIGHT_REVERT',
         message: 'The zero-knowledge proof failed local verification and was not submitted. Please try again.',
+      }
+    case 'PROVER_WORKER':
+      // The proving worker stopped (crashed, e.g. out of memory, or failed to load). The SDK starts a
+      // fresh worker on the next proof, so a retry is honest.
+      return {
+        code: 'PRE_FLIGHT_REVERT',
+        message: 'The prover stopped unexpectedly and nothing was sent. Please try again.',
       }
     case 'PROOF_EXPIRED':
     case 'PROOF_HANDLE_INVALIDATED':
@@ -175,6 +201,17 @@ export function classifyHandlerError(
   // (often opaque) SDK message into "Something went wrong".
   const sdk = classifySdkError(err)
   if (sdk) return sdk
+
+  // A multi-proof spend's fee (split transfer, consolidation) rose between review and build. Rebuilding
+  // with the same record re-plans the same higher fee, so retry is futile — FEE_EXPIRED gates it off and
+  // the modal sends the user back to start again, where review shows the new fee.
+  if (err instanceof SpendFeeIncreasedError) {
+    return {
+      code: 'FEE_EXPIRED',
+      message:
+        'Your balance changed since you reviewed this, and it now needs a higher fee. Nothing was sent — start again to review the new fee.',
+    }
+  }
 
   // Chain-mismatch: a pinned-chainId call hit a wallet that switched networks mid-flow (W-3/W-4).
   // Nothing was broadcast and retry is safe once the user switches back, so RPC_ERROR semantics

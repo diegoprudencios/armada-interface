@@ -2,13 +2,15 @@
 // ABOUTME: Shield = public → private; Unshield = private → your own EVM wallet (to-chain picker). The typed amount carries across the tab toggle.
 
 import { useRef, useState } from 'react'
-import { useAtom, useAtomValue } from 'jotai'
+import { useAtom } from 'jotai'
 import { openModalAtom } from '@/state/ui'
-import { preferencesAtom } from '@/state/preferences'
 import { useShieldFlow } from '@/hooks/useShieldFlow'
 import { useUnshieldFlow } from '@/hooks/useUnshieldFlow'
+import { RELAYER_CHECKING_REASON } from '@/hooks/useRelayerSubmitBlock'
+import { QUOTE_PENDING_REASON } from '@/lib/tx/submitQuote'
 import { getNetworkConfig } from '@/config/network'
 import { formatUsdcPlain } from '@/lib/format'
+import { txFiguresAs } from '@/lib/fees/txFigures'
 import { displayTxHash, txExplorerUrl } from '@/lib/explorer'
 import {
   ProgressStep,
@@ -31,6 +33,10 @@ import { ShieldWalletStep } from './ShieldWalletStep'
 import { ShieldCompleteStep } from './ShieldCompleteStep'
 import { SendReviewStep } from '@/components/payments/SendReviewStep'
 import { SendCompleteStep } from '@/components/payments/SendCompleteStep'
+import { useMergeNotes } from '@/hooks/useMergeNotes'
+
+/** Why Review holds a shield while the fee module's read of its protocol fee hasn't landed. */
+const SHIELD_FEE_PENDING_REASON = 'Getting the shield fee…'
 
 // Shield has a dedicated Wallet step (approve/sign); Unshield is relayer-submitted (no wallet sign).
 const SHIELD_TAB_STEPS = ['Amount', 'Review', 'Wallet', 'Confirm']
@@ -40,7 +46,6 @@ export function ShieldModal() {
   const [openModal, setOpenModal] = useAtom(openModalAtom)
   const isOpen = openModal === 'shield' || openModal === 'unshield'
   const initialTab: ShieldTab = openModal === 'unshield' ? 'unshield' : 'shield'
-  const prefs = useAtomValue(preferencesAtom)
   const hubChainId = getNetworkConfig().hub.chainId
 
   const [tab, setTab] = useState<ShieldTab>(initialTab)
@@ -60,6 +65,8 @@ export function ShieldModal() {
   // The nudge shakes the amount CARD (mockup), so the hook lives here — the common parent of the
   // card (Content) + CTA (Footer). Tapping the incomplete CTA fires nudge() + focus.
   const { shaking, nudge, onShakeAnimationEnd } = useNudgeShake()
+  // A spend blocked by fragmentation offers "Merge notes" on its error screen (a consolidate tx).
+  const { remedyFor } = useMergeNotes()
   const nudgeIncomplete = () => {
     nudge()
     amountInputRef.current?.focus()
@@ -82,6 +89,9 @@ export function ShieldModal() {
   const step = active.step
   const record = active.record
   const explorerUrl = txExplorerUrl(record?.walletContext.sourceChainId, displayTxHash(record))
+  // An unshield's confirmation reports what it actually charged, from its record (the live quote keeps
+  // refreshing after submit), matching the Activity receipt.
+  const unshieldReceipt = !isShield && record ? txFiguresAs(record, 'spend') : null
 
   // Per-tab step indicator: shield has the extra Wallet segment (4), unshield doesn't (3). The
   // unshield step is always a FlowStep (never 'wallet'), so the shared helpers apply there.
@@ -114,7 +124,15 @@ export function ShieldModal() {
       currentStep={currentStep}
       status={status}
     >
-      <RelayerStatusBanner isOpen={isOpen} />
+      <RelayerStatusBanner
+        isOpen={isOpen}
+        crossChain={(isShield ? shieldFlow.fromChainId : unshieldFlow.toChainId) !== hubChainId}
+        walletFallback={isShield}
+        // The availability nudge is a pre-submit decision aid — once past Review the path is
+        // committed (esp. direct shield, already signing/broadcasting), so it's just noise. The
+        // cross-chain delivery advisory still shows during progress.
+        showAvailability={step === 'input' || step === 'review'}
+      />
       {step === 'input' && (
         <>
           <ShieldAmountStepContent
@@ -135,7 +153,9 @@ export function ShieldModal() {
             displayFees={active.displayFees}
             flowBreakdown={active.flowBreakdown}
             feeLoading={active.feeLoading}
-            gaslessMode={isShield ? shieldFlow.useGasless : !prefs.submitFromWallet}
+            feeResolving={isShield ? shieldFlow.relayerResolving || shieldFlow.quotePending || shieldFlow.protocolFeePending : unshieldFlow.feeResolving}
+            feeUnavailable={!isShield && unshieldFlow.feeUnavailable}
+            gaslessMode={isShield ? shieldFlow.useGasless : true}
             gasChainId={isShield ? shieldFlow.fromChainId : hubChainId}
             inputRef={amountInputRef}
             shaking={shaking}
@@ -157,14 +177,31 @@ export function ShieldModal() {
           <ShieldReviewStep
             fromChainId={shieldFlow.fromChainId}
             amount={shieldFlow.amount}
-            fee={shieldFlow.feeInclusive}
-            netAmount={shieldFlow.netAmount}
+            fee={shieldFlow.reviewFigures?.fee ?? null}
+            netAmount={shieldFlow.reviewFigures?.netAmount ?? null}
             walletAddress={shieldFlow.evmAddress}
             walletProvider={shieldFlow.walletProvider}
             shieldedAddress={shieldFlow.shieldedAddress}
             isSubmitting={shieldFlow.isSubmitting}
             duplicateWarning={shieldFlow.duplicateWarning}
             feeUpdated={shieldFlow.feeChanged}
+            estimated={shieldFlow.reviewFigures?.estimated ?? false}
+            // Direct path only: the user pays ETH gas from their wallet. Suppressed on the gasless
+            // path (relayer covers gas) and while the relayer state is still resolving.
+            nativeGas={
+              !shieldFlow.useGasless && !shieldFlow.relayerResolving
+                ? shieldFlow.displayFees.nativeGas
+                : null
+            }
+            // Hold Confirm only while the relayer state is still resolving (we don't yet know
+            // gasless vs direct). Once resolved, the direct path submits from the wallet regardless
+            // of relayer availability, so there's no unavailable-block here (unlike spends).
+            submitBlockedReason={
+              shieldFlow.relayerResolving ? RELAYER_CHECKING_REASON
+              : shieldFlow.quotePending ? QUOTE_PENDING_REASON
+              : shieldFlow.protocolFeePending ? SHIELD_FEE_PENDING_REASON
+              : null
+            }
             onBack={shieldFlow.onBackToInput}
             onConfirm={shieldFlow.submit}
           />
@@ -174,11 +211,14 @@ export function ShieldModal() {
             recipient={unshieldFlow.recipient}
             armadaAddress={unshieldFlow.shieldedAddress}
             amount={unshieldFlow.amount}
-            fee={unshieldFlow.feeInclusive}
-            totalDeducted={unshieldFlow.totalDeducted}
+            // "—" until the unshield's plan prices it (the quote would suggest it fits, then jump).
+            fee={unshieldFlow.reviewFigures?.fee ?? null}
+            cctpFee={unshieldFlow.reviewFigures?.cctpFee ?? null}
+            totalDeducted={unshieldFlow.reviewFigures?.totalDeducted ?? null}
             networkName={unshieldFlow.networkName}
             recipientWalletProvider={unshieldFlow.recipientWalletProvider}
             submitBlockedReason={unshieldFlow.submitBlockedReason}
+            {...(unshieldFlow.onMergeNotes ? { onMergeNotes: unshieldFlow.onMergeNotes } : {})}
             feeUpdated={unshieldFlow.feeChanged}
             onBack={unshieldFlow.onBackToInput}
             isSubmitting={unshieldFlow.isSubmitting}
@@ -193,44 +233,48 @@ export function ShieldModal() {
         <ProgressStep record={record} sendVariant={isShield ? undefined : 'withdraw'} />
       )}
 
-      {step === 'complete' &&
-        (isShield ? (
-          <ShieldCompleteStep
-            fromChainId={shieldFlow.fromChainId}
-            amount={shieldFlow.amount}
-            fee={shieldFlow.feeInclusive}
-            netAmount={shieldFlow.netAmount}
-            walletAddress={shieldFlow.evmAddress}
-            walletProvider={shieldFlow.walletProvider}
-            shieldedAddress={shieldFlow.shieldedAddress}
-            confirmedAt={record?.updatedAt ?? Date.now()}
-            explorerUrl={explorerUrl}
-            onViewExplorer={() => {
-              if (explorerUrl) window.open(explorerUrl, '_blank', 'noopener,noreferrer')
-            }}
-            onGoToDashboard={close}
-          />
-        ) : (
-          <SendCompleteStep
-            variant="withdraw"
-            recipient={unshieldFlow.recipient}
-            armadaAddress={unshieldFlow.shieldedAddress}
-            amount={unshieldFlow.amount}
-            fee={unshieldFlow.feeInclusive}
-            totalDeducted={unshieldFlow.totalDeducted}
-            networkName={unshieldFlow.networkName}
-            recipientWalletProvider={unshieldFlow.recipientWalletProvider}
-            confirmedAt={record?.updatedAt ?? Date.now()}
-            explorerUrl={explorerUrl}
-            onViewExplorer={() => {
-              if (explorerUrl) window.open(explorerUrl, '_blank', 'noopener,noreferrer')
-            }}
-            onGoToDashboard={close}
-          />
-        ))}
+      {/* Confirm renders from the record only — the figures every later surface shows. */}
+      {step === 'complete' && isShield && shieldFlow.completeReceipt && (
+        <ShieldCompleteStep
+          fromChainId={shieldFlow.fromChainId}
+          amount={shieldFlow.completeReceipt.headline}
+          fee={shieldFlow.completeReceipt.fee}
+          netAmount={shieldFlow.completeReceipt.netAmount}
+          estimated={shieldFlow.completeReceipt.estimated}
+          walletAddress={shieldFlow.evmAddress}
+          walletProvider={shieldFlow.walletProvider}
+          shieldedAddress={shieldFlow.shieldedAddress}
+          confirmedAt={record?.updatedAt ?? Date.now()}
+          explorerUrl={explorerUrl}
+          onViewExplorer={() => {
+            if (explorerUrl) window.open(explorerUrl, '_blank', 'noopener,noreferrer')
+          }}
+          onGoToDashboard={close}
+        />
+      )}
+      {step === 'complete' && !isShield && unshieldReceipt && (
+        <SendCompleteStep
+          variant="withdraw"
+          recipient={unshieldFlow.recipient}
+          armadaAddress={unshieldFlow.shieldedAddress}
+          amount={unshieldReceipt.headline}
+          fee={unshieldReceipt.fee}
+          cctpFee={unshieldReceipt.cctpFee}
+          totalDeducted={unshieldReceipt.totalDeducted}
+          networkName={unshieldFlow.networkName}
+          recipientWalletProvider={unshieldFlow.recipientWalletProvider}
+          confirmedAt={record?.updatedAt ?? Date.now()}
+          explorerUrl={explorerUrl}
+          onViewExplorer={() => {
+            if (explorerUrl) window.open(explorerUrl, '_blank', 'noopener,noreferrer')
+          }}
+          onGoToDashboard={close}
+        />
+      )}
 
       {step === 'error' && (
         <ErrorStep
+          remedy={remedyFor(record)}
           error={record?.artifacts.error ?? null}
           message={active.submitError ?? undefined}
           explorerUrl={explorerUrl}

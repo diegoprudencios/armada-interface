@@ -1,5 +1,5 @@
 // ABOUTME: Network configuration for armada-interface — hub + client chain identities, RPC URLs, indexer/relayer/Iris endpoints.
-// ABOUTME: Driven by VITE_NETWORK env var (local | sepolia). All multi-chain config flows from here.
+// ABOUTME: VITE_NETWORK picks the mode (local | sepolia); VITE_ENABLED_CLIENTS selects clients from the registry. All multi-chain config flows from here.
 
 export type NetworkMode = 'local' | 'sepolia'
 
@@ -12,6 +12,27 @@ export interface ChainIdentity {
   readonly rpcUrls: readonly string[]
   /** Block explorer base URL. Undefined for local Anvil. */
   readonly explorerUrl?: string
+}
+
+/**
+ * A single client chain in the per-mode client registry. The registry holds *every* known client;
+ * an operator selects a subset at boot via `VITE_ENABLED_CLIENTS` (see `resolveEnabledClients`).
+ * Adding a new client is one new entry here — no positional/count assumptions elsewhere.
+ */
+export interface ClientEntry {
+  /**
+   * Human-friendly stable id used by `VITE_ENABLED_CLIENTS` to enable/disable this client at boot
+   * (e.g. `base-sepolia`). Operators enable by chain, not by the deploy tooling's positional role.
+   */
+  readonly key: string
+  readonly identity: ChainIdentity
+  /**
+   * Whether this client is active when `VITE_ENABLED_CLIENTS` is unset. Defaults to `true` (omit for
+   * the common case). Set `false` to catalog a client that isn't ready to run by default — e.g. its
+   * deployment manifest isn't published yet — so it exists in the registry and can be turned on
+   * explicitly via `VITE_ENABLED_CLIENTS` without breaking the default build.
+   */
+  readonly enabledByDefault?: boolean
 }
 
 export interface NetworkConfig {
@@ -55,6 +76,21 @@ export interface NetworkConfig {
    * `confirmationDepth`–`finalityThreshold`, spendable beyond. 0 on local Anvil (instant finality).
    */
   readonly finalityThreshold: number
+}
+
+/**
+ * Read an env var value, treating an empty or whitespace-only string as ABSENT (returns undefined).
+ *
+ * CI passes an unset repo variable to the build as `''` (an empty string, not undefined — see
+ * `.github/workflows/deploy.yml`, `VITE_x: ${{ vars.VITE_x }}`). An empty string satisfies a
+ * `?? default` / `?? null` fallback, so without this the value gets pinned to `''` — e.g. an empty RPC
+ * URL that makes ethers' JsonRpcProvider fail to detect its network. Trimming also drops accidental
+ * surrounding whitespace. Call with a STATIC `import.meta.env.VITE_x` member access (not a computed
+ * key) so Vite still inlines the value at build time.
+ */
+export function cleanEnv(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : undefined
 }
 
 export function getNetworkMode(): NetworkMode {
@@ -112,17 +148,107 @@ const LOCAL_CLIENT_B: ChainIdentity = {
   rpcUrls: ['http://localhost:8547'],
 } as const
 
-function sepoliaConfig(): NetworkConfig {
-  const sepoliaRpcPrimary = (import.meta.env.VITE_SEPOLIA_RPC as string | undefined)
-    ?? 'https://ethereum-sepolia-rpc.publicnode.com'
-  const sepoliaRpcFallback = import.meta.env.VITE_SEPOLIA_RPC_FALLBACK as string | undefined
+function localClientRegistry(): readonly ClientEntry[] {
+  return [
+    { key: 'anvil-client-a', identity: LOCAL_CLIENT_A },
+    { key: 'anvil-client-b', identity: LOCAL_CLIENT_B },
+  ]
+}
 
-  // Base Sepolia + Arbitrum Sepolia are the production-style client chains per CCTP docs;
-  // the exact pairing matches what the relayer + deployments expect.
-  const baseSepoliaRpc = (import.meta.env.VITE_BASE_SEPOLIA_RPC as string | undefined)
+function sepoliaClientRegistry(): readonly ClientEntry[] {
+  // Base Sepolia + Arbitrum Sepolia are the production-style client chains per CCTP docs; the exact
+  // pairing matches what the relayer + deployments expect. Per-client RPC overrides via env.
+  const baseSepoliaRpc = cleanEnv(import.meta.env.VITE_BASE_SEPOLIA_RPC as string | undefined)
     ?? 'https://sepolia.base.org'
-  const arbSepoliaRpc = (import.meta.env.VITE_ARB_SEPOLIA_RPC as string | undefined)
+  const arbSepoliaRpc = cleanEnv(import.meta.env.VITE_ARB_SEPOLIA_RPC as string | undefined)
     ?? 'https://sepolia-rollup.arbitrum.io/rpc'
+  const opSepoliaRpc = cleanEnv(import.meta.env.VITE_OP_SEPOLIA_RPC as string | undefined)
+    ?? 'https://sepolia.optimism.io'
+  return [
+    {
+      key: 'base-sepolia',
+      identity: {
+        chainId: 84532,
+        domain: 6,
+        name: 'Base Sepolia',
+        rpcUrls: [baseSepoliaRpc],
+        explorerUrl: 'https://sepolia.basescan.org',
+      },
+    },
+    {
+      key: 'arbitrum-sepolia',
+      identity: {
+        chainId: 421614,
+        domain: 3,
+        name: 'Arbitrum Sepolia',
+        rpcUrls: [arbSepoliaRpc],
+        explorerUrl: 'https://sepolia.arbiscan.io',
+      },
+      // Off by default: the canonical instance (demo3) ships Base + Optimism, not Arbitrum. Enable it
+      // for an Arbitrum-bearing instance with VITE_ENABLED_CLIENTS=base-sepolia,arbitrum-sepolia.
+      enabledByDefault: false,
+    },
+    {
+      key: 'optimism-sepolia',
+      identity: {
+        chainId: 11155420,
+        domain: 2,
+        name: 'Optimism Sepolia',
+        rpcUrls: [opSepoliaRpc],
+        explorerUrl: 'https://sepolia-optimism.etherscan.io',
+      },
+      // On by default — part of the canonical demo3 client set (Base + Optimism). The manifest is
+      // bound by embedded chainId, so it resolves whatever client<i> slot the deployment assigns it.
+    },
+  ]
+}
+
+/** The full client registry for a mode — every known client, before the enable-list filter. */
+export function getClientRegistry(mode: NetworkMode): readonly ClientEntry[] {
+  return mode === 'sepolia' ? sepoliaClientRegistry() : localClientRegistry()
+}
+
+/**
+ * Resolve the active client identities from a registry given the raw `VITE_ENABLED_CLIENTS` value:
+ *   - unset / empty / whitespace → the default-active clients (every entry except those marked
+ *     `enabledByDefault: false`), in registry order (backward compatible for all-default registries).
+ *   - a comma-separated subset of `key`s → those clients, in *registry* order (deterministic,
+ *     independent of the order the operator listed them), including entries that are off by default.
+ *     Surrounding whitespace + blank entries are ignored.
+ *   - any unknown key → throws a descriptive boot error listing the valid keys. Fail-fast beats
+ *     silently dropping a client the operator asked for.
+ */
+export function resolveEnabledClients(
+  registry: readonly ClientEntry[],
+  enabledCsv: string | undefined,
+): readonly ChainIdentity[] {
+  const keys = (enabledCsv ?? '').split(',').map(s => s.trim()).filter(Boolean)
+  if (keys.length === 0) {
+    return registry.filter(e => e.enabledByDefault !== false).map(e => e.identity)
+  }
+  const validKeys = registry.map(e => e.key)
+  for (const k of keys) {
+    if (!validKeys.includes(k)) {
+      throw new Error(
+        `VITE_ENABLED_CLIENTS: unknown client key "${k}". Valid keys: ${validKeys.join(', ')}.`,
+      )
+    }
+  }
+  return registry.filter(e => keys.includes(e.key)).map(e => e.identity)
+}
+
+/** Active client identities for a mode: the mode registry filtered by `VITE_ENABLED_CLIENTS`. */
+function resolveClientsForMode(mode: NetworkMode): readonly ChainIdentity[] {
+  return resolveEnabledClients(
+    getClientRegistry(mode),
+    import.meta.env.VITE_ENABLED_CLIENTS as string | undefined,
+  )
+}
+
+function sepoliaConfig(): NetworkConfig {
+  const sepoliaRpcPrimary = cleanEnv(import.meta.env.VITE_SEPOLIA_RPC as string | undefined)
+    ?? 'https://ethereum-sepolia-rpc.publicnode.com'
+  const sepoliaRpcFallback = cleanEnv(import.meta.env.VITE_SEPOLIA_RPC_FALLBACK as string | undefined)
 
   return {
     mode: 'sepolia',
@@ -133,36 +259,28 @@ function sepoliaConfig(): NetworkConfig {
       rpcUrls: sepoliaRpcFallback ? [sepoliaRpcPrimary, sepoliaRpcFallback] : [sepoliaRpcPrimary],
       explorerUrl: 'https://sepolia.etherscan.io',
     },
-    clients: [
-      {
-        chainId: 84532,
-        domain: 6,
-        name: 'Base Sepolia',
-        rpcUrls: [baseSepoliaRpc],
-        explorerUrl: 'https://sepolia.basescan.org',
-      },
-      {
-        chainId: 421614,
-        domain: 3,
-        name: 'Arbitrum Sepolia',
-        rpcUrls: [arbSepoliaRpc],
-        explorerUrl: 'https://sepolia.arbiscan.io',
-      },
-    ],
+    clients: resolveClientsForMode('sepolia'),
     // NO localhost fallback on sepolia (P0-10): a missing VITE_RELAYER_URL must yield '' so
     // `isRelayerConfigured()` is honestly false — not silently point the DEPLOYED app at the
     // visitor's own machine (and an http:// URL from an https:// page is blocked as mixed content
     // anyway). Set VITE_RELAYER_URL to the public HTTPS relayer for sepolia builds.
-    relayerUrl: (import.meta.env.VITE_RELAYER_URL as string | undefined) ?? '',
-    irisUrl: (import.meta.env.VITE_IRIS_URL as string | undefined) ?? 'https://iris-api-sandbox.circle.com',
-    indexerUrl: (import.meta.env.VITE_INDEXER_URL as string | undefined) ?? null,
+    relayerUrl: cleanEnv(import.meta.env.VITE_RELAYER_URL as string | undefined) ?? '',
+    irisUrl: cleanEnv(import.meta.env.VITE_IRIS_URL as string | undefined) ?? 'https://iris-api-sandbox.circle.com',
+    indexerUrl: cleanEnv(import.meta.env.VITE_INDEXER_URL as string | undefined) ?? null,
     pollIntervalMs: 15_000,
     maxLogRange: 5_000,
-    confirmationDepth: 2, // small buffer for Sepolia's rare, shallow reorgs
-    // Equal to confirmationDepth: a note is spendable as soon as it's persisted (≥ 2 blocks deep), so
-    // there's no separate visible "pending" window today. Raise it above confirmationDepth to surface
-    // recent notes as pending before they're spendable — the spendable/pending split already supports it.
-    finalityThreshold: 2,
+    // Stay one block behind head: Sepolia routinely reorgs its head block, and a 1-block hold-back means
+    // those reorgs can never remove a note the SDK has already persisted — no note that appears then
+    // vanishes, and no full rescan. The cost is ~one block (~12s) before a new note is visible. Deeper
+    // reorgs are handled by the SDK: it detects a reorg under its checkpoint by block hash and rescans
+    // from the deploy block — correct, but slow, which is why this hold-back is worth keeping.
+    confirmationDepth: 1,
+    // Equal to confirmationDepth: a note is spendable as soon as it's visible — no separate `pending`
+    // window (the split still exists; the window is just zero-width). Raise above confirmationDepth to
+    // surface freshly-scanned notes as `pending` before they're spendable, keeping the spendable subset
+    // (MAX / fee-on-top guard) conservative for shallow, still-reorgable notes — at the cost of delaying
+    // when a just-shielded note is re-spendable. Must stay ≥ confirmationDepth.
+    finalityThreshold: 1,
   }
 }
 
@@ -170,13 +288,13 @@ function localConfig(): NetworkConfig {
   return {
     mode: 'local',
     hub: LOCAL_HUB,
-    clients: [LOCAL_CLIENT_A, LOCAL_CLIENT_B],
-    relayerUrl: (import.meta.env.VITE_RELAYER_URL as string | undefined) ?? 'http://localhost:3001',
+    clients: resolveClientsForMode('local'),
+    relayerUrl: cleanEnv(import.meta.env.VITE_RELAYER_URL as string | undefined) ?? 'http://localhost:3001',
     // Iris URL is unused in local mode (CCTP relays via mock module), but populate for type completeness.
     irisUrl: 'https://iris-api-sandbox.circle.com',
     // Honor VITE_INDEXER_URL so the watcher quick-sync path can be exercised against a locally-run
     // indexer (see the F5 local-testing recipe). Unset → null → engine slow scan (B4 invariant).
-    indexerUrl: (import.meta.env.VITE_INDEXER_URL as string | undefined) ?? null,
+    indexerUrl: cleanEnv(import.meta.env.VITE_INDEXER_URL as string | undefined) ?? null,
     pollIntervalMs: 5_000,
     maxLogRange: 100_000,
     confirmationDepth: 0, // Anvil: instant finality, no reorgs

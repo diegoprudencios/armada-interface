@@ -10,6 +10,7 @@ import {
   truncateArmadaAddress,
 } from '@/lib/format'
 import { getChainById } from '@/config/network'
+import { formatNativeGasAmount, type NativeGasEstimate } from '@/lib/fees/displayFees'
 import usdcAmount from '@/design/styles/usdcAmount.module.css'
 import styles from './DepositReviewSummary.module.css'
 
@@ -19,7 +20,7 @@ export interface DepositReviewSummaryProps {
   fromChainId: number
   amount: bigint
   fee: bigint | null
-  netAmount: bigint
+  netAmount: bigint | null
   /** Connected EVM wallet address — rendered (truncated) as the "From your wallet" row when present. */
   walletAddress?: string
   /** Connected wallet provider name (wagmi connector) — drives the "From your wallet" brand glyph. */
@@ -28,6 +29,13 @@ export interface DepositReviewSummaryProps {
   shieldedAddress?: string
   /** Completion timestamp (ms) — when present, adds a leading "Date and time" row for confirmations. */
   confirmedAt?: number
+  /** Direct-path network-gas estimate (paid in ETH from the user's wallet) — renders a "Network gas"
+   *  row under Fees on the REVIEW step only. Omitted on gasless (relayer-covered) shields and on the
+   *  confirmation/receipt view (guarded by `confirmedAt`). */
+  nativeGas?: NativeGasEstimate | null
+  /** When true, the "You'll receive" total is an estimate (a cross-chain shield's final amount depends
+   *  on the CCTP fee set at delivery) — renders with a `≈` and a caption. */
+  estimated?: boolean
 }
 
 export function DepositReviewSummary({
@@ -38,6 +46,8 @@ export function DepositReviewSummary({
   walletProvider,
   shieldedAddress,
   confirmedAt,
+  estimated,
+  nativeGas,
 }: DepositReviewSummaryProps) {
   const fromChain = getChainById(fromChainId)
   const feeValue = fee ?? 0n
@@ -81,9 +91,19 @@ export function DepositReviewSummary({
         <div className={styles.summaryRow}>
           <span className={styles.summaryLabel}>Fees</span>
           <span className={[styles.summaryValue, usdcAmount.font].join(' ')}>
-            {fee === null ? '—' : `${formatUsdcAmount(feeValue)} USDC`}
+            {fee === null ? '—' : `${estimated ? '≈ ' : ''}${formatUsdcAmount(feeValue)} USDC`}
           </span>
         </div>
+        {/* Direct-path only (relayer down / no wrapper): the network gas the user pays in ETH from
+            their own wallet, separate from the inclusive USDC fee above. Hidden on the receipt. */}
+        {nativeGas && confirmedAt === undefined ? (
+          <div className={styles.summaryRow}>
+            <span className={styles.summaryLabel}>Network gas</span>
+            <span className={[styles.summaryValue, usdcAmount.font].join(' ')}>
+              {formatNativeGasAmount(nativeGas)}
+            </span>
+          </div>
+        ) : null}
       </div>
       {/* Deposit fees are inclusive: the wallet is charged `amount` and the shielded pool receives
           `amount - fees`. Show that net figure (not a fee-on-top total, which would overstate the charge). */}
@@ -93,9 +113,14 @@ export function DepositReviewSummary({
           {confirmedAt !== undefined ? 'You received' : "You'll receive"}
         </span>
         <span className={[styles.summaryTotalValue, usdcAmount.font].join(' ')}>
-          {formatUsdcAmount(netAmount)} USDC
+          {netAmount === null ? '—' : `${estimated ? '≈ ' : ''}${formatUsdcAmount(netAmount)} USDC`}
         </span>
       </div>
+      {estimated ? (
+        <div className={styles.summaryEstimateNote}>
+          Estimate — the final amount depends on the CCTP fee charged at delivery.
+        </div>
+      ) : null}
     </div>
   )
 }

@@ -67,7 +67,6 @@ function unshieldRecordWithHash(): TxRecord<'unshield-local'> {
       recipient: '0x3333333333333333333333333333333333333333',
       broadcasterFeeAmount: 0n,
       broadcasterShieldedAddress: '0zk1relayer',
-      useWalletOverride: false,
     },
     artifacts: { sourceTxHash: '0xfeed' },
     walletContext: { evmAddress: '0xabc', shieldedWalletId: 'rw-1', sourceChainId: 31337 },
@@ -91,6 +90,22 @@ describe('unshieldLocalHandler submit idempotency (P0-1 relayer path)', () => {
     expect(sendTransactionMock).not.toHaveBeenCalled()
     expect(buildUnshieldMock).not.toHaveBeenCalled()
     // It resumed via the relayer status poll and completed.
+    expect(pollMock).toHaveBeenCalledOnce()
+    const last = upserts.at(-1)
+    expect(last?.stage).toBe('hub-confirmed')
+    expect(last?.executionState).toBe('completed')
+    expect(last?.artifacts.sourceTxHash).toBe('0xfeed')
+  })
+
+  it('resumes from hub-pending (already broadcast) without re-POSTing and finalizes via the poll', async () => {
+    const { ctx, upserts } = makeCtx()
+    // A record persisted mid-confirmation: relayer accepted the POST, stage advanced to hub-pending.
+    const resumed: TxRecord<'unshield-local'> = { ...unshieldRecordWithHash(), stage: 'hub-pending' }
+    await unshieldLocalHandler.run(resumed, ctx)
+
+    expect(submitRelayMock).not.toHaveBeenCalled()
+    expect(sendTransactionMock).not.toHaveBeenCalled()
+    expect(buildUnshieldMock).not.toHaveBeenCalled()
     expect(pollMock).toHaveBeenCalledOnce()
     const last = upserts.at(-1)
     expect(last?.stage).toBe('hub-confirmed')

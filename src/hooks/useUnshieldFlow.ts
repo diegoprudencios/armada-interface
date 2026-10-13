@@ -5,24 +5,29 @@ import { useEffect, useRef, useState } from 'react'
 import { useAtomValue } from 'jotai'
 import { useAccount } from 'wagmi'
 import { evmAddressAtom, shieldedUsdcAtom, shieldedUsdcSpendableAtom, shieldedWalletAtom } from '@/state/wallet'
-import { preferencesAtom } from '@/state/preferences'
 import { useTx } from '@/hooks/useTx'
 import { useFees } from '@/hooks/useFees'
 import { useDisplayFees } from '@/hooks/useDisplayFees'
 import { useSpendableSyncGate } from '@/hooks/useSpendableSyncGate'
+import { useRelayerSubmitBlock } from '@/hooks/useRelayerSubmitBlock'
 import { cctpFastFeeForAmount, computeFeeBreakdown, userFeeForKind } from '@/lib/relayer'
 import { getChainById, getNetworkConfig } from '@/config/network'
 import { findDeploymentForChain, loadDeployments, type ResolvedDeployments } from '@/config/deployments'
 import { parseUsdcInput } from '@/lib/format'
 import { isShieldedAddress } from '@/lib/address'
 import { canRetryTx } from '@/lib/tx/executor'
-import { resolveFreshQuote } from '@/lib/tx/submitQuote'
+import { QUOTE_PENDING_REASON, resolveFreshQuote } from '@/lib/tx/submitQuote'
 import { trackError } from '@/lib/telemetry'
 import { assertSpendableForFeeOnTop } from '@/lib/tx/spendable'
 import type { FlowStep, FlowVisibleStep } from '@/components/flow'
 import type { DisplayFees } from '@/lib/fees/displayFees'
 import type { FlowFeeBreakdown } from '@/components/ui/FeeBreakdownTooltip'
 import type { TxRecord } from '@/lib/tx/types'
+import { txFiguresAs, type TxFigures } from '@/lib/fees/txFigures'
+import { spendDraft } from '@/lib/tx/spendDraft'
+import { useSpendCheck } from './useSpendCheck'
+import { useMergeNotes } from './useMergeNotes'
+import type { BlockedSpend } from '@/lib/shielded/merge-intent'
 
 type SubmittedKind = 'unshield-local' | 'unshield-xchain'
 
@@ -44,8 +49,14 @@ export interface UnshieldFlow {
   displayFees: DisplayFees
   feeLoading: boolean
   flowBreakdown: FlowFeeBreakdown
-  /** Inclusive fee (broadcaster + on-chain protocol + CCTP) shown on the review/complete cards. */
-  feeInclusive: bigint
+  /** The figures Review shows — rendered from the draft this unshield will submit; null until its plan prices it. */
+  reviewFigures: Extract<TxFigures, { model: 'spend' }> | null
+  /** The unshield's planned fee is known — until then (and when it can't be planned) the fee reads "—". */
+  feeKnown: boolean
+  /** The unshield is being planned: the amount card says "Estimating fees…" instead of a figure. */
+  feeResolving: boolean
+  /** The unshield can't be planned at this amount: the amount card shows the fee as "—". */
+  feeUnavailable: boolean
   /** True when a submit-time fee refetch changed the fee — the review step shows the FeeUpdatedBanner. */
   feeChanged: boolean
   totalDeducted: bigint
@@ -58,6 +69,8 @@ export interface UnshieldFlow {
   networkName?: string
   destDeploymentError?: string
   submitBlockedReason?: string
+  /** Set when the wallet is too fragmented for this unshield — the review offers "Merge notes". */
+  onMergeNotes?: () => void
   // Flow state
   step: FlowStep
   isSubmitting: boolean
@@ -72,7 +85,6 @@ export interface UnshieldFlow {
 }
 
 export function useUnshieldFlow(isOpen: boolean): UnshieldFlow {
-  const prefs = useAtomValue(preferencesAtom)
   const shieldedWallet = useAtomValue(shieldedWalletAtom)
 
   // Destination = the connected EVM wallet (pinned; this is "unshield to my own wallet").
@@ -108,6 +120,8 @@ export function useUnshieldFlow(isOpen: boolean): UnshieldFlow {
   // Gate Confirm while the initial shielded-balance sync is incomplete — every unshield spends
   // the user's shielded USDC.
   const syncGate = useSpendableSyncGate()
+  // Unshield is relayer-submitted with no wallet fallback (#23) — block Confirm when unavailable.
+  const relayerBlock = useRelayerSubmitBlock(isOpen)
 
   // Deployment manifests — validate that the chosen destination chain actually has a deployment
   // present, otherwise the user could pick a chain the submit step would throw on.
@@ -153,9 +167,26 @@ export function useUnshieldFlow(isOpen: boolean): UnshieldFlow {
         : null
   const record = activeTx?.record ?? null
 
-  // Display fee per (kind, amount, quote): unshield-local → relayer's `unshield` tier;
-  // unshield-xchain → `crossChainUnshield` tier + a CCTP fast-fee (~2 bps) on the destination mint.
-  const fee: bigint = userFeeForKind(computedKind, amount, quote)
+  // The relayer's per-proof quote per (kind, amount): unshield-local → its `unshield` tier;
+  // unshield-xchain → `crossChainUnshield` tier (+ a CCTP fast-fee ~2 bps on the destination mint).
+  const quotedFee: bigint = userFeeForKind(computedKind, amount, quote)
+  // Unshields never split. It's planned — on the amount and review steps, like a private send — for the
+  // fee its plan charges (the SDK folds small change into the fee when that's what makes it fit) and so a
+  // wallet too fragmented for it is offered "Merge notes" before anything is attempted.
+  const unshieldSpend: BlockedSpend = { kind: computedKind, amount, perProofFee: quotedFee }
+  // Nothing is planned until the relayer quote loads: its per-proof fee would read 0, and a plan priced at 0 would
+  // show a zero fee (spec G-4).
+  const quotePending = quote === null
+  const spendCheck = useSpendCheck({
+    enabled: isOpen && (step === 'input' || step === 'review'),
+    spend: quotePending ? null : unshieldSpend,
+    token: 'usdc',
+    balanceKey: `${max}`,
+  })
+  // The fee the unshield's plan charges. The quote only stands in for the arithmetic below until it's
+  // known; the fee itself reads as pending / "—" meanwhile.
+  const fee: bigint = spendCheck.fee ?? quotedFee
+  const { openMerge } = useMergeNotes()
   const cctpFee: bigint = isXchain ? cctpFastFeeForAmount(amount) : 0n
   const { fees: displayFees, isLoading: feeLoading } = useDisplayFees(
     computedKind,
@@ -173,11 +204,30 @@ export function useUnshieldFlow(isOpen: boolean): UnshieldFlow {
   const flowBreakdown: FlowFeeBreakdown = {
     broadcasterFee: fee,
     cctpFee: isXchain ? cctpFee : undefined,
+    // Taken from the amount in transit, not charged on top — listed in the tooltip, not in the FEE caption.
+    cctpFeeFromAmount: isXchain,
     recipientReceives,
     totalDeducted,
     recipientLabel: "You'll receive",
   }
-  const feeInclusive = fee + displayFees.protocolFee + cctpFee
+  // The record this unshield will submit, built once from the reviewed figures — by the same builder as the Send
+  // modal's public path, so the two entry flows record (and show) the same figures. Review renders it through
+  // txFigures, like every later surface, and submit sends it: the stored record is what Review showed. Null until
+  // the plan prices the unshield.
+  const reviewed = spendCheck.fee === null
+    ? null
+    : spendDraft(computedKind, {
+        amount,
+        recipient,
+        toChainId,
+        fee: spendCheck.fee,
+        perProofFee: quotedFee,
+        protocolFee: displayFees.protocolFee,
+        cctpFee,
+        feeCacheId: quote?.cacheId ?? '',
+        broadcasterShieldedAddress: quote?.broadcasterShieldedAddress ?? '',
+      })
+  const reviewFigures = reviewed ? txFiguresAs(reviewed, 'spend') : null
 
   // Reset local state on close so re-opening starts fresh.
   useEffect(() => {
@@ -213,7 +263,7 @@ export function useUnshieldFlow(isOpen: boolean): UnshieldFlow {
       // if the fee moved since Review, bounce back with the banner rather than silently swapping it.
       const { quote: activeQuote, feeChanged: changed } = await resolveFreshQuote({
         refresh,
-        reviewedFee: fee,
+        reviewedFee: quotedFee,
         feeOf: (s) => userFeeForKind(computedKind, amount, s),
       })
       if (!activeQuote) {
@@ -225,14 +275,20 @@ export function useUnshieldFlow(isOpen: boolean): UnshieldFlow {
         return
       }
       const feeCacheId = activeQuote.cacheId
+      // The unshield is re-planned at the fresh quote: the wallet's notes may plan differently than at
+      // review (a sync landed), e.g. change that can no longer be folded into the fee. A different total
+      // means the user hasn't approved it — re-review.
+      const perProofFee = userFeeForKind(computedKind, amount, activeQuote)
+      const freshFee = await spendCheck.priceAt(perProofFee)
+      if (reviewed === null || freshFee !== reviewed.meta.broadcasterFeeAmount) {
+        await spendCheck.invalidate()
+        setFeeChanged(true)
+        setStep('review')
+        return
+      }
       // S-M5: re-validate amount + the FRESH relayer fee against the balance before proof gen. Both
-      // kinds draw the fee from the shielded balance (fee-on-top) on the relayer path; wallet-
-      // override pays native gas separately, so no shielded fee applies there.
-      const freshFee =
-        computedKind === 'unshield-local'
-          ? BigInt(activeQuote.fees.unshield)
-          : BigInt(activeQuote.fees.crossChainUnshield)
-      assertSpendableForFeeOnTop({ amount, fee: prefs.submitFromWallet ? 0n : freshFee, balance: max })
+      // kinds draw the fee from the shielded balance (fee-on-top) on the relayer path.
+      assertSpendableForFeeOnTop({ amount, fee: freshFee, balance: max })
       // Fail fast if the relayer published a malformed broadcaster address — avoid a 20-30s proof
       // gen doomed to surface an opaque SDK throw deep in the pipeline.
       if (!isShieldedAddress(activeQuote.broadcasterShieldedAddress)) {
@@ -241,27 +297,14 @@ export function useUnshieldFlow(isOpen: boolean): UnshieldFlow {
             'problem persists, the relayer may be misconfigured.',
         )
       }
-      if (computedKind === 'unshield-local') {
+      // What the unshield submits is the reviewed draft, with the fresh quote's cache id + broadcaster address.
+      const fresh = { feeCacheId, broadcasterShieldedAddress: activeQuote.broadcasterShieldedAddress }
+      if (reviewed.kind === 'unshield-local') {
         setSubmittedKind('unshield-local')
-        submittedId = await txUnshieldLocal.submit({
-          amount,
-          feeCacheId,
-          recipient,
-          broadcasterFeeAmount: BigInt(activeQuote.fees.unshield),
-          broadcasterShieldedAddress: activeQuote.broadcasterShieldedAddress,
-          useWalletOverride: prefs.submitFromWallet,
-        })
+        submittedId = await txUnshieldLocal.submit({ ...reviewed.meta, ...fresh })
       } else {
         setSubmittedKind('unshield-xchain')
-        submittedId = await txUnshieldXchain.submit({
-          amount,
-          feeCacheId,
-          toChainId,
-          recipient,
-          broadcasterFeeAmount: BigInt(activeQuote.fees.crossChainUnshield),
-          broadcasterShieldedAddress: activeQuote.broadcasterShieldedAddress,
-          useWalletOverride: prefs.submitFromWallet,
-        })
+        submittedId = await txUnshieldXchain.submit({ ...reviewed.meta, ...fresh })
       }
       if (submittedId === null) return
       setStep('progress')
@@ -305,19 +348,27 @@ export function useUnshieldFlow(isOpen: boolean): UnshieldFlow {
     max,
     pendingUsdc,
     displayFees,
-    feeLoading,
+    feeLoading: feeLoading || spendCheck.pending || quotePending,
     flowBreakdown,
-    feeInclusive,
+    reviewFigures,
+    feeKnown: spendCheck.fee !== null,
+    feeResolving: spendCheck.pending || quotePending,
+    feeUnavailable: spendCheck.error !== null,
     feeChanged,
     totalDeducted,
-    inputMax,
+    // Max: the SDK's unshield max (one proof, one tree), falling back to the one-fee cap until it's known.
+    inputMax: spendCheck.maxInput ?? inputMax,
     isXchain,
     recipient,
     shieldedAddress: shieldedWallet.shieldedAddress,
     recipientWalletProvider: connector?.name,
     networkName: getChainById(toChainId)?.name,
     destDeploymentError,
-    submitBlockedReason: syncGate.reason ?? undefined,
+    submitBlockedReason:
+      syncGate.reason ?? relayerBlock ?? (quotePending ? QUOTE_PENDING_REASON : null) ?? spendCheck.blockReason ?? undefined,
+    ...(spendCheck.remedy === 'merge-notes'
+      ? { onMergeNotes: () => openMerge({ token: 'usdc', blocked: unshieldSpend }) }
+      : {}),
     step,
     isSubmitting,
     record,

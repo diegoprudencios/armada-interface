@@ -1,24 +1,21 @@
 // ABOUTME: Transfer-shielded stage handler — 0zk → 0zk private send. Relayer-mediated submit (A4); zero EVM wallet prompts.
 // ABOUTME: Build-proof with broadcaster fee → POST /relay → poll /status → hub-confirmed. Mirrors features/unshield/handler.ts pattern.
 
-import { sendTransaction } from 'wagmi/actions'
 import { loadDeployments } from '@/config/deployments'
 import { getNetworkConfig } from '@/config/network'
-import { wagmiConfig } from '@/config/wagmi'
-import { ensureChain } from '@/lib/network-switch'
-import { waitForReceiptOrFail } from '@/lib/tx/receipt'
-import { simulateOrThrow } from '@/lib/tx/simulate'
 import {
   getWalletId as kmGetWalletId,
   isUnlocked as kmIsUnlocked,
 } from '@/lib/shielded/keyManager'
 import { refreshShieldedBalances } from '@/lib/shielded/sync'
 import { buildTransferSdk } from '@/lib/shielded/transfer-sdk'
+import { encodeTxSelfMetadata } from '@/lib/shielded/selfMetadata'
+import { markSpendPendingForRecord, clearSpendPendingForTx, forgetSpendPlan } from '@/lib/shielded/pending-spend'
 import { submitRelay } from '@/lib/relayer'
 import { handleRelaySubmitError } from '@/lib/tx/relaySubmit'
 import { advance, markFailed } from '@/lib/tx/reducer'
 import { recordBroadcastHash } from '@/lib/tx/broadcast'
-import { poll, pollBudgetMs, pollRelayStatusOnce } from '@/lib/tx/poller'
+import { poll, pollBudgetMs, pollRelayStatusOnce, RELAYER_STATUS_POLL_INTERVAL_MS } from '@/lib/tx/poller'
 import { classifyHandlerError } from '@/lib/tx/errors'
 import { throwIfForcedError } from '@/lib/tx/devForce'
 import { createProofProgressWriter } from '@/lib/tx/progress'
@@ -28,9 +25,10 @@ import type { TxError, TxRecord } from '@/lib/tx/types'
 
 /**
  * `transfer-shielded` stages (Phase A4 — relayer-mediated):
- *   1. `build-proof`    — generate the Groth16 transfer proof with broadcaster fee baked in
- *                          (~20-30s on local Anvil). The proof embeds a USDC output to the
- *                          relayer's 0zk address at the advertised fee amount.
+ *   1. `build-proof`    — generate the Groth16 transfer proof(s) with broadcaster fee baked in
+ *                          (~20-30s each on local Anvil). A fragmented wallet splits into several
+ *                          supported-shape proofs combined into one atomic `transact([...])`; each
+ *                          embeds its share of the USDC output to the relayer's 0zk address.
  *   2. `submit-relayer` — populate `transact()` calldata, POST to relayer's `/relay`, poll
  *                          `/status` until confirmed (or failed).
  *   3. `hub-confirmed`  — terminal. Kicks a balance refresh.
@@ -41,7 +39,7 @@ import type { TxError, TxRecord } from '@/lib/tx/types'
  */
 export const transferShieldedHandler: StageHandler<'transfer-shielded'> = {
   kind: 'transfer-shielded',
-  resumableFrom: ['submit-relayer'],
+  resumableFrom: ['submit-relayer', 'hub-pending'],
 
   async run(record, ctx) {
     try {
@@ -51,12 +49,18 @@ export const transferShieldedHandler: StageHandler<'transfer-shielded'> = {
         await runBuildProof(record, ctx)
         return
       }
-      if (record.stage === 'submit-relayer') {
+      if (record.stage === 'submit-relayer' || record.stage === 'hub-pending') {
+        // `submit-relayer` broadcasts (then advances to `hub-pending`); `hub-pending` is the
+        // resume/retry entry for an already-broadcast tx — re-entry is idempotent (sourceTxHash
+        // present → skips the broadcast, re-waits for confirmation).
         await runSubmitAndConfirm(record, ctx)
         return
       }
       // hub-confirmed is terminal; defensive no-op for resume-on-load.
     } catch (err) {
+      // Nothing was broadcast on this path (or the stash was already consumed at broadcast), so no
+      // input needs holding — drop any stashed plans (#55) rather than keep them for the session.
+      forgetSpendPlan(record.id)
       if (ctx.signal.aborted) return
       const failed = markFailed(record, classifyHandlerError(err, 'Private send failed.', record.artifacts.sourceTxHash, getNetworkConfig().hub.chainId))
       await ctx.upsert(failed)
@@ -64,13 +68,13 @@ export const transferShieldedHandler: StageHandler<'transfer-shielded'> = {
   },
 }
 
-/** A6 — see comment in features/unshield/handler.ts::broadcasterFeeFromRecord. */
+/** The broadcaster fee note context — always present (spends are relayer-submitted; #23). `amount` is
+ *  the per-proof fee the planner charges once per proof. */
 function broadcasterFeeFromRecord(
   record: TxRecord<'transfer-shielded'>,
-): { amount: bigint; recipientAddress: string } | null {
-  if (record.meta.useWalletOverride) return null
+): { amount: bigint; recipientAddress: string } {
   return {
-    amount: record.meta.broadcasterFeeAmount,
+    amount: record.meta.broadcasterFeePerProof ?? record.meta.broadcasterFeeAmount,
     recipientAddress: record.meta.broadcasterShieldedAddress,
   }
 }
@@ -88,17 +92,34 @@ async function runBuildProof(
   if (ctx.signal.aborted) throw new Error('cancelled')
 
   const progress = createProofProgressWriter(record, ctx.signal)
+  // Persist the recoverable bucket-C fields (#44) in the spend's change note so a fresh scan recovers
+  // them even after local storage is cleared.
+  const selfMetadata = encodeTxSelfMetadata({
+    feeCacheId: record.meta.feeCacheId,
+  })
   // Build (plan → prove off-thread → serialize) the transact calldata and stash it, so submit-relayer
-  // dispatches it without re-proving — and, persisted in the record, it survives a reload.
-  const { to, data } = await buildTransferSdk({
+  // dispatches it without re-proving — and, persisted in the record, it survives a reload. `recordId`
+  // lets the builder stash the plan so submit can mark its inputs pending after broadcast (#55).
+  // `maxTotalFee` is the fee the user reviewed: the build refuses to charge more (the wallet may have
+  // fragmented into more proofs since review).
+  const { to, data, totalFee } = await buildTransferSdk({
     recipient: record.meta.recipient,
     amount: record.meta.amount,
     broadcasterFee: bf,
+    maxTotalFee: record.meta.broadcasterFeeAmount,
     poolAddress: deployments.hub.contracts.privacyPool as `0x${string}`,
     onProgress: progress.write,
+    recordId: record.id,
+    ...(selfMetadata ? { selfMetadata } : {}),
   })
   if (ctx.signal.aborted) throw new Error('cancelled')
-  await ctx.upsert(advance(progress.latest(), 'submit-relayer', { transferTx: { to, data, value: '0' } }))
+  const built = advance(progress.latest(), 'submit-relayer', { transferTx: { to, data, value: '0' } })
+  // Record the fee actually charged (≤ the reviewed fee) so the receipt shows what was paid.
+  await ctx.upsert(
+    totalFee === record.meta.broadcasterFeeAmount
+      ? built
+      : { ...built, meta: { ...built.meta, broadcasterFeeAmount: totalFee } },
+  )
 }
 
 async function runSubmitAndConfirm(
@@ -122,48 +143,6 @@ async function runSubmitAndConfirm(
       throw new Error('Transfer calldata missing — start a new transaction.')
     }
     populated = { to: stashed.to, data: stashed.data, value: BigInt(stashed.value) }
-  }
-
-  // A6 wallet-override path — submit through the user's EVM wallet instead of the relayer.
-  // The proof has no broadcaster output (sendWithPublicWallet=true on the SDK side), so the
-  // verifier would reject; we go direct. Terminal state is identical to the relayer path.
-  if (record.meta.useWalletOverride) {
-    let hash = existingHash
-    let broadcastRecord = record
-    if (!hash) {
-      const tx = populated!
-      await ensureChain(hubChainId)
-      if (ctx.signal.aborted) throw new Error('cancelled')
-      // S-M8: pre-flight simulate so an on-chain revert surfaces as a typed PRE_FLIGHT_REVERT
-      // ("nothing was sent") instead of MetaMask's opaque 30M-gas-fallback "gas limit too high".
-      const sender = record.walletContext.evmAddress
-      if (sender) {
-        await simulateOrThrow({
-          to: tx.to,
-          data: tx.data,
-          value: tx.value,
-          account: sender as `0x${string}`,
-          chainId: hubChainId,
-        })
-        if (ctx.signal.aborted) throw new Error('cancelled')
-      }
-      hash = await sendTransaction(wagmiConfig, {
-        to: tx.to,
-        data: tx.data,
-        value: tx.value,
-        chainId: hubChainId,
-      })
-      const broadcast = await recordBroadcastHash(record, hash, ctx)
-      if (broadcast.dismissed) return
-      broadcastRecord = broadcast.record
-    }
-    await waitForReceiptOrFail({ hash, signal: ctx.signal, chainId: hubChainId })
-    if (kmIsUnlocked()) {
-      void refreshShieldedBalances(kmGetWalletId()).catch(() => {})
-    }
-    const completed = advance(broadcastRecord, 'hub-confirmed', { sourceTxHash: hash })
-    await ctx.upsert(completed)
-    return
   }
 
   // Idempotency guard (P0-1): once the relayer accepted the POST we persist the returned txHash.
@@ -197,11 +176,21 @@ async function runSubmitAndConfirm(
     const broadcast = await recordBroadcastHash(record, txHash, ctx)
     if (broadcast.dismissed) return
     broadcastRecord = broadcast.record
+    // #55: hold this spend's inputs so a rapid follow-up spend won't reselect them before the
+    // Nullified event is scanned. No-op on resume (no stashed plan). Best-effort.
+    await markSpendPendingForRecord(record.id, txHash)
+  }
+
+  // Enter the on-chain confirmation stage before polling (idempotent for resume/retry), so the
+  // stepper shows the confirming step instead of holding on "Submitting transaction".
+  if (broadcastRecord.stage !== 'hub-pending') {
+    broadcastRecord = advance(broadcastRecord, 'hub-pending')
+    await ctx.upsert(broadcastRecord)
   }
 
   const pollResult = await poll(
     (signal) => pollRelayStatusOnce(txHash, signal, hubChainId),
-    { signal: ctx.signal, timeoutMs: pollBudgetMs(record) },
+    { signal: ctx.signal, timeoutMs: pollBudgetMs(record), intervalMs: RELAYER_STATUS_POLL_INTERVAL_MS },
   )
 
   if (pollResult.status === 'aborted') throw new Error('cancelled')
@@ -224,6 +213,9 @@ async function runSubmitAndConfirm(
 
   if (final.status === 'failed') {
     track('tx.relayer.rejected', { id: record.id, kind: record.kind, errorCode: 'EXECUTION_FAILED' })
+    // #55: the tx reverted → its inputs were NOT nullified on-chain, so release the optimistic hold
+    // now instead of waiting out the TTL, freeing the notes for the next spend.
+    await clearSpendPendingForTx(txHash)
     const error: TxError = {
       code: 'TX_REVERTED',
       message: final.error ?? 'Relayer-broadcast tx reverted on chain.',

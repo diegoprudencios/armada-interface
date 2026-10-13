@@ -1,11 +1,11 @@
 // ABOUTME: Tests for ShieldModal orchestrator — open/closed gating, step advancement (input → review → progress), close resets state.
 // ABOUTME: Seeds openModalAtom + usdcBalancesAtom so the user can enter an amount and proceed.
 
-import { describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { render, screen, fireEvent, act, waitFor, cleanup } from '@testing-library/react'
 import { Provider, createStore } from 'jotai'
 import { ShieldModal } from './ShieldModal'
-import { openModalAtom } from '@/state/ui'
+import { mergeIntentAtom, openModalAtom } from '@/state/ui'
 import {
   activeShieldedWalletIdAtom,
   evmAddressAtom,
@@ -15,8 +15,12 @@ import {
 } from '@/state/wallet'
 import { feeQuoteAtom, feeQuoteFetchedAtAtom } from '@/state/fees'
 import { txListAtom } from '@/state/tx'
+import { cctpFastFeeForAmount } from '@/lib/relayer'
 import { withTestQueryClient } from '@/test-utils/queryClient'
 import type { TxRecord } from '@/lib/tx/types'
+import { C, C_ACTUAL, F, P } from '@/test/fixtures/txValues'
+import { headlineAmount, readFigures, summaryRow } from '@/test/summaryRows'
+import { ActivityReceipt } from '@/components/dashboard/ActivityReceipt/ActivityReceipt'
 
 /** A POLL_TIMEOUT'd shield of `amount` (6dp) for the active test wallet — may still be on-chain. */
 function unresolvedShield(amount: bigint): TxRecord {
@@ -39,6 +43,14 @@ function unresolvedShield(amount: bigint): TxRecord {
 // don't mount one, so stub the hook with a deterministic DisplayFees value. The protocolFee
 // arithmetic is exercised by relayer.test.ts; this mock just keeps the modal renderable.
 // This tab is the executor leader (single-tab test env) so useTx.submit isn't refused (P1-26).
+// Healthy, resolved relayer so shield's resolving gate never holds Confirm (relayerResolving=false).
+vi.mock('@/hooks/useRelayerHealth', () => ({
+  useRelayerHealth: () => ({
+    isConfigured: true, isUnreachable: false, isChecking: false, isIndexerStalled: false,
+    data: { status: 'healthy' }, refetch: vi.fn(),
+  }),
+}))
+
 vi.mock('@/lib/tx/executor', async (importActual) => ({
   ...await importActual<typeof import('@/lib/tx/executor')>(),
   getIsLeader: () => true,
@@ -49,16 +61,19 @@ vi.mock('@/lib/tx/executor', async (importActual) => ({
   executeTx: () => {},
 }))
 
+// The protocol shield fee (an on-chain fee-module read); 0 unless a test sets it.
+const hoistedDisplay = vi.hoisted(() => ({ protocolFee: 0n, protocolFeeStatus: 'exact' as 'exact' | 'pending' | 'estimate' }))
 vi.mock('@/hooks/useDisplayFees', () => ({
   useDisplayFees: () => ({
     fees: {
-      protocolFee: 0n,
+      protocolFee: hoistedDisplay.protocolFee,
       gasFee: 0n,
       nativeGas: null,
-      totalFee: 0n,
+      totalFee: hoistedDisplay.protocolFee,
       feeInclusive: true,
     },
     isLoading: false,
+    protocolFeeStatus: hoistedDisplay.protocolFeeStatus,
   }),
 }))
 
@@ -83,14 +98,30 @@ const STUB_FEE_QUOTE = {
     shieldXchain: '0',
   },
 }
+// The quote a test runs with — STUB_FEE_QUOTE unless it sets another, or null (the relayer quote hasn't loaded).
+const quoteHolder: { quote: typeof STUB_FEE_QUOTE | null } = { quote: STUB_FEE_QUOTE }
 vi.mock('@/hooks/useFees', () => ({
   useFees: () => ({
-    quote: STUB_FEE_QUOTE,
+    quote: quoteHolder.quote,
     isStale: false,
     isUnavailable: false,
-    refresh: async () => STUB_FEE_QUOTE,
+    refresh: async () => quoteHolder.quote,
   }),
 }))
+
+// The deployment manifest isn't served in the test env. A test that needs the gasless (relayer-paid) shield path sets
+// a hub wrapper address; otherwise the real loader runs (and the shield goes direct, from the wallet).
+const hoistedDeployments = vi.hoisted(() => ({ hubWrapper: null as string | null }))
+vi.mock('@/config/deployments', async (importActual) => {
+  const actual = await importActual<typeof import('@/config/deployments')>()
+  return {
+    ...actual,
+    loadDeployments: (...args: Parameters<typeof actual.loadDeployments>) =>
+      hoistedDeployments.hubWrapper !== null
+        ? Promise.resolve({ hub: { contracts: { gaslessShieldWrapper: hoistedDeployments.hubWrapper } }, clients: [] } as never)
+        : actual.loadDeployments(...args),
+  }
+})
 
 // ShieldModal reads the connected EVM address via wagmi's useAccount for the review-step summary;
 // these tests don't mount a WagmiProvider, so stub it with a fixed address.
@@ -128,6 +159,36 @@ const FAKE_QUOTE = {
   broadcasterShieldedAddress: '',
   fees: { transfer: '0', unshield: '0', crossContract: '0', crossChainShield: '0', crossChainUnshield: '0', shield: '0', shieldXchain: '0' },
 }
+
+// Unshields are dry-run at review for fragmentation; each test sets the outcome.
+// Like the real hook, it plans the spend's fee (the SDK can fold small change into it) and does nothing once disabled.
+const hoistedCheck = vi.hoisted(() => {
+  const defaults = () => ({
+    fee: 0n as bigint | null,
+    maxInput: null as bigint | null,
+    error: null as string | null,
+    remedy: null as 'merge-notes' | null,
+    pending: false,
+    blockReason: null as string | null,
+    priceAt: vi.fn(async (_perProofFee: bigint) => 0n),
+    invalidate: vi.fn(async () => {}),
+  })
+  return { defaults, result: defaults() }
+})
+// Like the real hook, it plans nothing while disabled or with no spend to plan (e.g. before the relayer quote loads).
+vi.mock('@/hooks/useSpendCheck', () => ({
+  useSpendCheck: (args: { enabled: boolean; spend: unknown }) =>
+    args.enabled && args.spend !== null
+      ? hoistedCheck.result
+      : { ...hoistedCheck.result, fee: null, maxInput: null, error: null, remedy: null, pending: false, blockReason: null },
+}))
+beforeEach(() => {
+  hoistedCheck.result = hoistedCheck.defaults()
+  hoistedDisplay.protocolFee = 0n
+  hoistedDisplay.protocolFeeStatus = 'exact'
+  quoteHolder.quote = STUB_FEE_QUOTE
+  hoistedDeployments.hubWrapper = null
+})
 
 function renderModal(opts?: {
   open?: boolean
@@ -284,6 +345,177 @@ describe('<ShieldModal> — Shield/Unshield tabs', () => {
     expect(screen.getByLabelText('Unshield amount')).toBeInTheDocument()
   })
 
+  // A quote with real per-proof fees, so showing the quote where the planned fee belongs would be visible.
+  function withQuotedUnshieldFees(run: () => Promise<void> | void) {
+    return async () => {
+      const { unshield, crossChainUnshield } = STUB_FEE_QUOTE.fees
+      STUB_FEE_QUOTE.fees.unshield = '1286550'
+      STUB_FEE_QUOTE.fees.crossChainUnshield = '1500000'
+      try {
+        await run()
+      } finally {
+        STUB_FEE_QUOTE.fees.unshield = unshield
+        STUB_FEE_QUOTE.fees.crossChainUnshield = crossChainUnshield
+      }
+    }
+  }
+
+  it('an unshield shows the fee its plan charges (change folded in), not the one-proof quote', withQuotedUnshieldFees(() => {
+    hoistedCheck.result = { ...hoistedCheck.defaults(), fee: 2_118_648n }
+    renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '5' } })
+    expect(screen.getByText(/2\.118648/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    expect(screen.getByText(/7\.118648/)).toBeInTheDocument() // 5 + the planned fee
+    expect(screen.queryByText(/1\.28655/)).toBeNull()
+  }))
+
+  it('an unshield shows "Estimating fees…" while it is planned, not the one-proof quote', withQuotedUnshieldFees(() => {
+    hoistedCheck.result = { ...hoistedCheck.defaults(), fee: null, pending: true, blockReason: 'Checking your notes…' }
+    renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '5' } })
+    expect(screen.getByText(/Estimating fees…/)).toBeInTheDocument()
+    expect(screen.queryByText(/1\.28655/)).toBeNull()
+  }))
+
+  it('an unshield that can\'t be made shows its fee as "—" and holds Confirm with the reason', withQuotedUnshieldFees(() => {
+    hoistedCheck.result = { ...hoistedCheck.defaults(), fee: null, error: 'Insufficient shielded balance for this transaction.', blockReason: 'Insufficient shielded balance for this transaction.' }
+    renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '5' } })
+    expect(screen.getByText('+ — FEE')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    expect(screen.getByText('Insufficient shielded balance for this transaction.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Confirm/ })).toBeDisabled()
+  }))
+
+  it('an unshield re-prices at the fresh quote and records its planned total with the per-proof fee', withQuotedUnshieldFees(async () => {
+    hoistedCheck.result = { ...hoistedCheck.defaults(), fee: 2_118_648n, priceAt: vi.fn(async () => 2_118_648n) }
+    const store = renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '5' } })
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+    })
+    await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === 'unshield-local')).toBe(true))
+    expect(hoistedCheck.result.priceAt).toHaveBeenCalledWith(1_286_550n)
+    const record = store.get(txListAtom).find((r) => r.kind === 'unshield-local') as TxRecord<'unshield-local'>
+    expect(record.meta.broadcasterFeeAmount).toBe(2_118_648n)
+    expect(record.meta.broadcasterFeePerProof).toBe(1_286_550n)
+  }))
+
+  it('a cross-chain unshield records its planned total with the per-proof fee too', withQuotedUnshieldFees(async () => {
+    hoistedCheck.result = { ...hoistedCheck.defaults(), fee: 1_527_000n, priceAt: vi.fn(async () => 1_527_000n) }
+    const store = renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.click(screen.getByLabelText('Network'))
+    fireEvent.click(screen.getByRole('option', { name: /Anvil Client A/ }))
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+    })
+    await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === 'unshield-xchain')).toBe(true))
+    expect(hoistedCheck.result.priceAt).toHaveBeenCalledWith(1_500_000n)
+    const record = store.get(txListAtom).find((r) => r.kind === 'unshield-xchain') as TxRecord<'unshield-xchain'>
+    expect(record.meta.broadcasterFeeAmount).toBe(1_527_000n)
+    expect(record.meta.broadcasterFeePerProof).toBe(1_500_000n)
+  }))
+
+  it('an unshield offers its Max from the SDK (one proof, one tree), not balance minus a fee', () => {
+    hoistedCheck.result = { ...hoistedCheck.defaults(), maxInput: 5_832_098n }
+    renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.click(screen.getByRole('button', { name: /Max/ }))
+    expect(screen.getByLabelText('Unshield amount')).toHaveValue('5.832098')
+  })
+
+  it('an unshield returns to Review with the fee-updated banner when the re-priced fee differs', withQuotedUnshieldFees(async () => {
+    hoistedCheck.result = { ...hoistedCheck.defaults(), fee: 1_286_550n, priceAt: vi.fn(async () => 2_118_648n) }
+    const store = renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '5' } })
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+    })
+    await waitFor(() => expect(hoistedCheck.result.invalidate).toHaveBeenCalled())
+    expect(store.get(txListAtom).some((r) => r.kind === 'unshield-local')).toBe(false)
+    expect(screen.getByRole('button', { name: /^Confirm/ })).toBeInTheDocument()
+  }))
+
+  it('an unshield holds Confirm while its notes are being checked', () => {
+    hoistedCheck.result = { ...hoistedCheck.defaults(), fee: null, pending: true, blockReason: 'Checking your notes…' }
+    renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    expect(screen.getByText('Checking your notes…')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Confirm/ })).toBeDisabled()
+  })
+
+  it('an unshield the wallet is too fragmented for offers "Merge notes" at review, with Confirm disabled', () => {
+    hoistedCheck.result = { ...hoistedCheck.defaults(), fee: null, error: 'Your balance is spread across too many small notes for this transaction. Merge your notes, then try again.', remedy: 'merge-notes' }
+    const store = renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    expect(screen.getByText('Too many small notes')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Confirm/ })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Merge notes' }))
+    expect(store.get(openModalAtom)).toBe('merge')
+    expect(store.get(mergeIntentAtom)).toEqual({ token: 'usdc', blocked: { kind: 'unshield-local', amount: 3_000_000n, perProofFee: 0n } })
+  })
+
+  it('the unshield confirmation shows the fee its record says was charged, not the live quote', async () => {
+    const store = renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+    })
+    await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === 'unshield-local')).toBe(true))
+    // The live quote says 0; the record carries what the unshield was actually charged.
+    act(() => {
+      store.set(txListAtom, store.get(txListAtom).map((r) =>
+        r.kind === 'unshield-local'
+          ? ({ ...r, executionState: 'completed', stage: 'hub-confirmed', meta: { ...r.meta, broadcasterFeeAmount: 25_000n } } as TxRecord)
+          : r,
+      ))
+    })
+    await waitFor(() => expect(screen.getAllByText('0.025 USDC').length).toBeGreaterThan(0))
+    expect(screen.getByText(/3\.025/)).toBeInTheDocument()
+  })
+
+  it('a cross-chain unshield record keeps the CCTP fee shown at review, so its receipt reports the full fee', async () => {
+    const store = renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.click(screen.getByLabelText('Network'))
+    fireEvent.click(screen.getByRole('option', { name: /Anvil Client A/ }))
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+    })
+    await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === 'unshield-xchain')).toBe(true))
+    const record = store.get(txListAtom).find((r) => r.kind === 'unshield-xchain') as TxRecord<'unshield-xchain'>
+    expect(record.meta.cctpFee).toBe(cctpFastFeeForAmount(3_000_000n))
+    expect(record.meta.cctpFee).toBeGreaterThan(0n)
+  })
+
+  it('offers "Merge notes" when an unshield failed because the wallet is too fragmented', async () => {
+    const store = renderModal({ open: true, kind: 'unshield', spendable: 10_000_000n, evm: EVM })
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+    })
+    await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === 'unshield-local')).toBe(true))
+    act(() => {
+      store.set(txListAtom, store.get(txListAtom).map((r) =>
+        r.kind === 'unshield-local'
+          ? ({ ...r, executionState: 'failed', artifacts: { ...r.artifacts, error: { code: 'PRE_FLIGHT_REVERT', message: 'Merge your notes, then try again.', remedy: 'merge-notes' } } } as TxRecord)
+          : r,
+      ))
+    })
+    fireEvent.click(await screen.findByRole('button', { name: 'Merge notes' }))
+    expect(store.get(openModalAtom)).toBe('merge')
+    expect(store.get(mergeIntentAtom)).toMatchObject({ token: 'usdc', blocked: { kind: 'unshield-local', amount: 3_000_000n } })
+  })
+
   it('opens on the Shield tab from openModal=shield with both tabs present', () => {
     renderModal({ open: true, kind: 'shield', max: 10_000_000n, spendable: 10_000_000n, evm: EVM })
     expect(screen.getByText('Shield your USDC')).toBeInTheDocument()
@@ -296,5 +528,248 @@ describe('<ShieldModal> — Shield/Unshield tabs', () => {
     fireEvent.change(screen.getByLabelText('Shield amount'), { target: { value: '7' } })
     fireEvent.click(screen.getByRole('tab', { name: 'Unshield' }))
     expect(screen.getByLabelText('Unshield amount')).toHaveValue('7')
+  })
+
+  describe('the confirmation screen shows the figures its record carries (spec fixture)', () => {
+    /** Settle the submitted `kind` record with `meta` patched in, as its handler would. */
+    function settle(store: ReturnType<typeof renderModal>, kind: TxRecord['kind'], stage: string, meta: Record<string, unknown>) {
+      act(() => {
+        store.set(txListAtom, store.get(txListAtom).map((r) =>
+          r.kind === kind ? ({ ...r, executionState: 'completed', stage, meta: { ...r.meta, ...meta } } as TxRecord) : r,
+        ))
+      })
+    }
+    async function submitShield(chainName?: RegExp) {
+      const store = renderModal({ open: true, max: 20_000_000n })
+      // Public USDC on every chain, so a cross-chain source has a balance to shield from.
+      act(() => store.set(usdcBalancesAtom, { 31337: 20_000_000n, 31338: 20_000_000n }))
+      if (chainName) {
+        fireEvent.click(screen.getByLabelText('Network'))
+        fireEvent.click(screen.getByRole('option', { name: chainName }))
+      }
+      fireEvent.change(screen.getByLabelText('Shield amount'), { target: { value: '10' } })
+      fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+      })
+      return store
+    }
+    async function submitUnshield(chainName?: RegExp) {
+      hoistedCheck.result = { ...hoistedCheck.defaults(), fee: F, priceAt: vi.fn(async () => F) }
+      const store = renderModal({ open: true, kind: 'unshield', spendable: 20_000_000n, evm: EVM })
+      if (chainName) {
+        fireEvent.click(screen.getByLabelText('Network'))
+        fireEvent.click(screen.getByRole('option', { name: chainName }))
+      }
+      fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '10' } })
+      fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+      })
+      return store
+    }
+
+    it('shield, relayer + protocol fee: Fees and the net received (SH-1…SH-3)', async () => {
+      const store = await submitShield()
+      await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === 'shield')).toBe(true))
+      settle(store, 'shield', 'hub-confirmed', { useGasless: true, feeAmount: F, protocolFee: P })
+      await waitFor(() => expect(screen.getByText('You received')).toBeInTheDocument())
+      expect(headlineAmount()).toBe('10')
+      expect(summaryRow('Fees')).toBe('1.020014 USDC')
+      expect(summaryRow('You received')).toBe('8.979986 USDC')
+    })
+
+    it('cross-chain shield, reconciled: relayer + protocol + the actual CCTP fee (SH-13, SH-14)', async () => {
+      const store = await submitShield(/Anvil Client A/)
+      await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === 'shield-xchain')).toBe(true))
+      settle(store, 'shield-xchain', 'hub-mint-confirmed', { useGasless: true, feeAmount: F, protocolFee: P, cctpFee: C_ACTUAL, cctpFeeIsEstimate: false })
+      await waitFor(() => expect(screen.getByText('You received')).toBeInTheDocument())
+      expect(headlineAmount()).toBe('10')
+      expect(summaryRow('Fees')).toBe('1.170015 USDC')
+      expect(summaryRow('You received')).toBe('8.829985 USDC')
+    })
+
+    it('unshield on the hub: Fees F, Total amount + F (UN-2, UN-3)', async () => {
+      const store = await submitUnshield()
+      await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === 'unshield-local')).toBe(true))
+      settle(store, 'unshield-local', 'hub-confirmed', { broadcasterFeeAmount: F })
+      await waitFor(() => expect(screen.getByText('Total')).toBeInTheDocument())
+      expect(headlineAmount()).toBe('10')
+      expect(summaryRow('Fees')).toBe('1.000003 USDC')
+      expect(summaryRow('Total')).toBe('11.000003 USDC')
+    })
+
+    it('unshield cross-chain: the amount step\'s fee caption is the relayer fee — the CCTP fee comes out of the amount (UN-2x)', () => {
+      hoistedCheck.result = { ...hoistedCheck.defaults(), fee: F, priceAt: vi.fn(async () => F) }
+      renderModal({ open: true, kind: 'unshield', spendable: 20_000_000n, evm: EVM })
+      fireEvent.click(screen.getByLabelText('Network'))
+      fireEvent.click(screen.getByRole('option', { name: /Anvil Client A/ }))
+      fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '10' } })
+      expect(screen.getByText('+ $1.000003 FEE')).toBeInTheDocument()
+    })
+
+    it('unshield cross-chain: the relayer fee, the CCTP fee from the amount (est.), Total amount + F (UN-2x, D2)', async () => {
+      const store = await submitUnshield(/Anvil Client A/)
+      await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === 'unshield-xchain')).toBe(true))
+      settle(store, 'unshield-xchain', 'client-mint-confirmed', { broadcasterFeeAmount: F, cctpFee: C })
+      await waitFor(() => expect(screen.getByText('Total')).toBeInTheDocument())
+      expect(summaryRow('Relayer fee')).toBe('1.000003 USDC')
+      expect(summaryRow('CCTP fee (from amount)')).toBe('≈ 0.300007 USDC')
+      expect(summaryRow('Total')).toBe('11.000003 USDC')
+    })
+  })
+
+  describe('Review, the confirmation screen and the Activity receipt show the same figures (G-1, G-2, G-10)', () => {
+    /** Settle the submitted `kind` record exactly as submitted, and read the confirmation + receipt figures. */
+    async function confirmAndReceipt(store: ReturnType<typeof renderModal>, kind: TxRecord['kind'], rows: { confirm: Record<string, string>; receipt: Record<string, string> }) {
+      await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === kind)).toBe(true))
+      act(() => {
+        store.set(txListAtom, store.get(txListAtom).map((r) =>
+          r.kind === kind ? ({ ...r, executionState: 'completed', stage: 'hub-confirmed' } as TxRecord) : r,
+        ))
+      })
+      await waitFor(() => expect(screen.getByText(Object.values(rows.confirm)[1]!)).toBeInTheDocument())
+      const confirm = readFigures(rows.confirm)
+      const record = store.get(txListAtom).find((r) => r.kind === kind)!
+      cleanup()
+      render(<ActivityReceipt record={record} open onClose={vi.fn()} />)
+      return { confirm, receipt: readFigures(rows.receipt) }
+    }
+    async function shieldFigures(chainName?: RegExp) {
+      hoistedDisplay.protocolFee = P
+      const store = renderModal({ open: true, max: 20_000_000n })
+      act(() => store.set(usdcBalancesAtom, { 31337: 20_000_000n, 31338: 20_000_000n }))
+      if (chainName) {
+        fireEvent.click(screen.getByLabelText('Network'))
+        fireEvent.click(screen.getByRole('option', { name: chainName }))
+      }
+      fireEvent.change(screen.getByLabelText('Shield amount'), { target: { value: '10' } })
+      fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+      const review = readFigures({ fees: 'Fees', net: "You'll receive" })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+      })
+      const rows = { fees: 'Fees', net: 'You received' }
+      return { review, ...await confirmAndReceipt(store, chainName ? 'shield-xchain' : 'shield', { confirm: rows, receipt: rows }) }
+    }
+    async function unshieldFigures(chainName?: RegExp) {
+      hoistedCheck.result = { ...hoistedCheck.defaults(), fee: F, priceAt: vi.fn(async () => F) }
+      const store = renderModal({ open: true, kind: 'unshield', spendable: 20_000_000n, evm: EVM })
+      if (chainName) {
+        fireEvent.click(screen.getByLabelText('Network'))
+        fireEvent.click(screen.getByRole('option', { name: chainName }))
+      }
+      fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '10' } })
+      fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+      const rows: Record<string, string> = chainName ? { fees: 'Relayer fee', cctp: 'CCTP fee (from amount)', total: 'Total' } : { fees: 'Fees', total: 'Total' }
+      const review = readFigures(rows)
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+      })
+      return { review, ...await confirmAndReceipt(store, chainName ? 'unshield-xchain' : 'unshield-local', { confirm: rows, receipt: rows }) }
+    }
+
+    it('shield on the hub', async () => {
+      const { review, confirm, receipt } = await shieldFigures()
+      expect(review.fees).toBe('0.020011 USDC')
+      expect(confirm).toEqual(review)
+      expect(receipt).toEqual(review)
+    })
+
+    it('cross-chain shield, before delivery: the reviewed CCTP estimate stays in the record (G-2)', async () => {
+      const { review, confirm, receipt } = await shieldFigures(/Anvil Client A/)
+      // Protocol fee + the CCTP estimate (2 bps of 10 = 0.002) — the CCTP fee isn't dropped anywhere.
+      expect(review).toEqual({ headline: '10', fees: '0.022011 USDC', net: '9.977989 USDC' })
+      expect(confirm).toEqual(review)
+      expect(receipt).toEqual(review)
+    })
+
+    it('unshield on the hub', async () => {
+      const { review, confirm, receipt } = await unshieldFigures()
+      expect(review).toEqual({ headline: '10', fees: '1.000003 USDC', total: '11.000003 USDC' })
+      expect(confirm).toEqual(review)
+      expect(receipt).toEqual(review)
+    })
+
+    it('unshield cross-chain: the Unshield tab shows the same fee as its confirmation and the Send modal (G-10)', async () => {
+      const { review, confirm, receipt } = await unshieldFigures(/Anvil Client A/)
+      // The relayer fee; the CCTP estimate (2 bps of 10 = 0.002) on its own row; the total deducted is amount + relayer fee.
+      expect(review).toEqual({ headline: '10', fees: '1.000003 USDC', cctp: '0.002 USDC', total: '11.000003 USDC' })
+      expect(confirm).toEqual(review)
+      expect(receipt).toEqual(review)
+    })
+  })
+
+  describe('gasless (relayer-paid) shield', () => {
+    function gaslessShieldReview(quote: typeof STUB_FEE_QUOTE | null) {
+      hoistedDeployments.hubWrapper = '0x' + 'e'.repeat(40)
+      hoistedDisplay.protocolFee = P
+      quoteHolder.quote = quote
+      renderModal({ open: true, max: 20_000_000n })
+      fireEvent.change(screen.getByLabelText('Shield amount'), { target: { value: '10' } })
+    }
+
+    it('Review: the relayer + protocol fee and the net received (SH-1…SH-3)', async () => {
+      gaslessShieldReview({ ...STUB_FEE_QUOTE, fees: { ...STUB_FEE_QUOTE.fees, shield: String(F) } })
+      await waitFor(() => expect(screen.getByText('incl. $1.020014 FEE')).toBeInTheDocument())
+      fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+      expect(summaryRow('Fees')).toBe('1.020014 USDC')
+      expect(summaryRow("You'll receive")).toBe('8.979986 USDC')
+    })
+
+    it('before the relayer quote loads: no fee ("—") and Confirm held (G-4)', async () => {
+      gaslessShieldReview(null)
+      await waitFor(() => expect(screen.getByText('Estimating fees…')).toBeInTheDocument())
+      fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+      expect(summaryRow('Fees')).toBe('—')
+      expect(summaryRow("You'll receive")).toBe('—')
+      expect(screen.getByText('Getting the relayer fee…')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /^Confirm/ })).toBeDisabled()
+    })
+  })
+
+  it('an unshield before the relayer quote loads: "Estimating fees…", then no fee ("—") and Confirm held (G-4)', () => {
+    quoteHolder.quote = null
+    hoistedCheck.result = { ...hoistedCheck.defaults(), fee: 0n, priceAt: vi.fn(async () => 0n) }
+    renderModal({ open: true, kind: 'unshield', spendable: 20_000_000n, evm: EVM })
+    fireEvent.change(screen.getByLabelText('Unshield amount'), { target: { value: '3' } })
+    expect(screen.getByText('Estimating fees…')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+    expect(summaryRow('Fees')).toBe('—')
+    expect(summaryRow('Total')).toBe('—')
+    expect(screen.getByText('Getting the relayer fee…')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Confirm/ })).toBeDisabled()
+  })
+
+  describe('the shield\'s protocol fee, until the fee module prices it (#74)', () => {
+    function reviewShield() {
+      hoistedDisplay.protocolFee = P
+      const store = renderModal({ open: true, max: 20_000_000n })
+      fireEvent.change(screen.getByLabelText('Shield amount'), { target: { value: '10' } })
+      fireEvent.click(screen.getByRole('button', { name: /Review/ }))
+      return store
+    }
+
+    it('while its read is in flight: no fee ("—") and Confirm held (G-4)', () => {
+      hoistedDisplay.protocolFeeStatus = 'pending'
+      reviewShield()
+      expect(summaryRow('Fees')).toBe('—')
+      expect(summaryRow("You'll receive")).toBe('—')
+      expect(screen.getByText('Getting the shield fee…')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /^Confirm/ })).toBeDisabled()
+    })
+
+    it('when the fee module can\'t be read: the ~50 bps estimate, marked "≈" — and recorded as an estimate (G-5)', async () => {
+      hoistedDisplay.protocolFeeStatus = 'estimate'
+      const store = reviewShield()
+      expect(summaryRow('Fees')).toBe('≈ 0.020011 USDC')
+      expect(summaryRow("You'll receive")).toBe('≈ 9.979989 USDC')
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /^Confirm/ }))
+      })
+      await waitFor(() => expect(store.get(txListAtom).some((r) => r.kind === 'shield')).toBe(true))
+      const record = store.get(txListAtom).find((r) => r.kind === 'shield') as TxRecord<'shield'>
+      expect(record.meta).toMatchObject({ protocolFee: P, protocolFeeIsEstimate: true })
+    })
   })
 })

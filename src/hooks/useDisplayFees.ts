@@ -8,7 +8,9 @@ import { loadFeeModuleAddress } from '@/config/deployments'
 import { feeModuleAbi } from '@/lib/fees/feeModuleAbi'
 import {
   computeDisplayFees,
+  resolveShieldProtocolFee,
   type DisplayFees,
+  type ShieldProtocolFeeStatus,
 } from '@/lib/fees/displayFees'
 import type { FeeSchedule } from '@/lib/relayer'
 import type { TxKind } from '@/lib/tx/types'
@@ -21,7 +23,7 @@ const FEE_MODULE_QUERY_KEY = ['fee-module-address'] as const
  * Debounce window for the on-chain shield-fee read. The ShieldModal calls this hook on every
  * keystroke of the amount field; without debouncing, each keystroke fired a `calculateShieldFee`
  * `eth_call`. A 400ms trailing window collapses a typing burst into one read once the amount
- * settles, while the local 50 bps fallback covers the Fee row in the interim. (P2 perf)
+ * settles; in the interim the fee is `pending` and the flow reads "Estimating fees…". (P2 perf)
  */
 const SHIELD_FEE_DEBOUNCE_MS = 400
 
@@ -30,9 +32,22 @@ export function useDisplayFees(
   amount: bigint,
   gasChainId: number,
   quote: FeeSchedule | null,
-): { fees: DisplayFees; isLoading: boolean } {
+  /**
+   * Base the protocol shield fee is charged on, when it differs from `amount`. A gasless shield
+   * carves the relayer fee out first as its own shielded note, so the pool takes the 50 bps fee on
+   * `(amount - relayerFee)`, not the full deposit — passing that reduced base here keeps both the
+   * on-chain `calculateShieldFee` read and the fallback aligned with the note that actually lands.
+   * Defaults to `amount` (direct shield: no relayer fee carved out).
+   */
+  shieldFeeBase?: bigint,
+  /**
+   * The integrator the shield will carry — the fee module prices by it. Defaults to the configured integrator; a
+   * gasless or cross-chain shield carries none (`shieldFeeIntegrator`).
+   */
+  integrator: string = getIntegratorAddress(),
+): { fees: DisplayFees; isLoading: boolean; protocolFeeStatus: ShieldProtocolFeeStatus } {
   const hubChainId = getNetworkConfig().hub.chainId
-  const integrator = getIntegratorAddress()
+  const feeBase = shieldFeeBase ?? amount
 
   const { data: feeModuleAddress } = useQuery({
     queryKey: FEE_MODULE_QUERY_KEY,
@@ -48,37 +63,37 @@ export function useDisplayFees(
   // surface only the much-smaller CCTP fast-fee ("<0.01 USDC" on a $10 client deposit).
   const isShieldKind = kind === 'shield' || kind === 'shield-xchain'
   // Debounce the amount the on-chain read keys off so a typing burst fires one eth_call, not one
-  // per keystroke. The displayed Fee row still tracks the live amount via the 50 bps fallback below
-  // until the debounced read for the settled amount resolves.
-  const debouncedAmount = useDebouncedValue(amount, SHIELD_FEE_DEBOUNCE_MS)
-  const needsOnChainShieldFee = isShieldKind && debouncedAmount > 0n && Boolean(feeModuleAddress)
+  // per keystroke. Until the debounced read for the settled amount resolves, the fee is `pending`.
+  const debouncedBase = useDebouncedValue(feeBase, SHIELD_FEE_DEBOUNCE_MS)
+  const needsOnChainShieldFee = isShieldKind && debouncedBase > 0n && Boolean(feeModuleAddress)
 
-  const { data: shieldFeeResult, isLoading: shieldFeeLoading } = useReadContract({
+  const { data: shieldFeeResult, isLoading: shieldFeeLoading, isError: shieldFeeReadFailed } = useReadContract({
     address: feeModuleAddress ?? undefined,
     abi: feeModuleAbi,
     functionName: 'calculateShieldFee',
-    args: [integrator, debouncedAmount],
+    args: [integrator as `0x${string}`, debouncedBase],
     chainId: hubChainId,
     query: { enabled: needsOnChainShieldFee },
   })
 
   const nativeGas = useNativeGasEstimate(gasChainId, kind)
 
+  // Only trust the on-chain result when it was computed for the base currently displayed — while the user is
+  // mid-keystroke the debounced read lags the live base. Until it lands the fee is `pending` (no fee to show or submit
+  // against); when the fee module can't be read at all (no manifest, or the read failed) it's the ~50 bps `estimate`,
+  // marked as one — never 0 (spec G-4, G-5).
+  const shieldProtocol = isShieldKind
+    ? resolveShieldProtocolFee({
+        feeBase,
+        onChain: shieldFeeResult?.[2],
+        onChainMatchesLive: debouncedBase === feeBase,
+        feeModule: feeModuleAddress === undefined ? 'loading' : feeModuleAddress === null || shieldFeeReadFailed ? 'unavailable' : 'available',
+      })
+    : null
+
   const fees = useMemo(() => {
     const base = computeDisplayFees(kind, amount, quote)
-    let protocolFee = base.protocolFee
-    // Only trust the on-chain result when it was computed for the amount currently displayed —
-    // while the user is mid-keystroke the debounced read lags the live amount, so we fall back to
-    // the 50 bps estimate rather than show a fee for a stale amount.
-    const onChainMatchesLive = debouncedAmount === amount
-    if (isShieldKind && shieldFeeResult && onChainMatchesLive) {
-      protocolFee = shieldFeeResult[2]
-    } else if (isShieldKind && feeModuleAddress && amount > 0n) {
-      // Fallback while the on-chain read is loading or the amount is still settling: ~50 bps
-      // matches deployed fee module `baseArmadaTakeBps` so the Fee row doesn't flash a misleading
-      // lower value during the async window before the wagmi result lands.
-      protocolFee = (amount * 50n) / 10_000n
-    }
+    const protocolFee = shieldProtocol?.protocolFee ?? base.protocolFee
     const feeInclusive =
       kind === 'shield' || kind === 'shield-xchain' || kind === 'unshield-xchain'
     return {
@@ -88,11 +103,11 @@ export function useDisplayFees(
       totalFee: protocolFee,
       feeInclusive,
     }
-  }, [kind, amount, debouncedAmount, quote, shieldFeeResult, feeModuleAddress, isShieldKind, nativeGas])
+  }, [kind, amount, quote, shieldProtocol?.protocolFee, nativeGas])
 
   const isLoading = needsOnChainShieldFee && shieldFeeLoading
 
-  return { fees, isLoading }
+  return { fees, isLoading, protocolFeeStatus: shieldProtocol?.status ?? 'exact' }
 }
 
 /** Net USDC credited after inclusive protocol fees (deposit / CCTP). */

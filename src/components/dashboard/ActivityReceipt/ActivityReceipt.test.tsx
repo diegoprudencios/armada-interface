@@ -21,7 +21,53 @@ function shieldRecord(): TxRecord {
   } as unknown as TxRecord
 }
 
+function mergeRecord(): TxRecord {
+  return {
+    ...shieldRecord(),
+    kind: 'consolidate',
+    meta: {
+      amount: 0n, feeCacheId: 'x', tokenAddress: '0xusdc', tokenSymbol: 'USDC',
+      broadcasterFeeAmount: 40_000n, broadcasterShieldedAddress: '0zk_r', notesMerged: 11, notesCreated: 2,
+    },
+  } as unknown as TxRecord
+}
+
 describe('<ActivityReceipt>', () => {
+  it('a cross-chain unshield receipt includes the CCTP fee it recorded, as the confirmation screen does', () => {
+    const xchain = {
+      ...shieldRecord(),
+      kind: 'unshield-xchain',
+      stage: 'client-mint-confirmed',
+      meta: {
+        amount: 100_000_000n, feeCacheId: 'x', toChainId: 84532, recipient: '0x1234567890abcdef1234567890abcdef12345678',
+        broadcasterFeeAmount: 1_500_000n, broadcasterShieldedAddress: '0zk_r', cctpFee: 20_000n,
+      },
+    } as unknown as TxRecord
+    render(<ActivityReceipt record={xchain} open onClose={vi.fn()} />)
+    // Itemised: the relayer fee charged on top, and the CCTP fee (an estimate) taken from the amount.
+    expect(screen.getByText('1.50 USDC')).toBeInTheDocument()
+    expect(screen.getByText('≈ 0.02 USDC')).toBeInTheDocument()
+  })
+
+  it('a received payment shows no Fees row (the recipient pays none, and can\'t see the sender\'s)', () => {
+    const received = {
+      ...shieldRecord(),
+      kind: 'transfer-shielded-received',
+      stage: 'observed',
+      meta: { amount: 10_000_000n },
+    } as unknown as TxRecord
+    render(<ActivityReceipt record={received} open onClose={vi.fn()} />)
+    expect(screen.getByText('USDC received')).toBeInTheDocument()
+    expect(screen.queryByText('Fees')).toBeNull()
+  })
+
+  it('shows a note merge by its fee, with the notes merged', () => {
+    render(<ActivityReceipt record={mergeRecord()} open onClose={vi.fn()} />)
+    expect(screen.getByText('Notes merged')).toBeInTheDocument()
+    expect(screen.getByText('0.04')).toBeInTheDocument()
+    expect(screen.getByText('11 → 2')).toBeInTheDocument()
+  })
+
   it('renders nothing when record is null', () => {
     render(<ActivityReceipt record={null} open onClose={vi.fn()} />)
     expect(screen.queryByText('USDC shield')).toBeNull()
@@ -33,6 +79,41 @@ describe('<ActivityReceipt>', () => {
     expect(screen.getByText('100.5')).toBeInTheDocument()
     // The reused DepositReviewSummary surfaces the confirmed "Date and time" row.
     expect(screen.getByText('Date and time')).toBeInTheDocument()
+  })
+
+  it('nets a gasless shield by BOTH the relayer fee and the protocol shield fee', () => {
+    // The real 4-USDC gasless shield: relayer fee 0.742317, protocol shield fee 0.016288. The receipt
+    // must show received = 4 - 0.742317 - 0.016288 = 3.241395 (→ "3.24"), NOT 4 - relayerFee = 3.257683
+    // ("3.26", the bug where the protocol fee was omitted).
+    const record = {
+      ...shieldRecord(),
+      meta: {
+        amount: 4_000_000n, feeAmount: 742_317n, protocolFee: 16_288n, useGasless: true,
+        fromChainId: 31337, feeCacheId: 'x',
+      },
+    } as unknown as TxRecord
+    render(<ActivityReceipt record={record} open onClose={vi.fn()} />)
+    expect(screen.getByText('3.241395 USDC')).toBeInTheDocument()
+    expect(screen.queryByText('3.257683 USDC')).toBeNull()
+    // Fees row shows the combined 0.758605, not the relayer-only 0.742317.
+    expect(screen.getByText('0.758605 USDC')).toBeInTheDocument()
+  })
+
+  it('nets a recovered shield-xchain by the relayer, protocol AND CCTP fees (Fix A)', () => {
+    // A recovered cross-chain shield: amount is the TRUE deposit (CCTP burn amount), and the note that
+    // landed = burn − cctp − protocol (relayer 0 here). received = 3 − 0.025388 − 0.014873 = 2.959739;
+    // the fees row shows the combined 0.040261, not just one leg.
+    const record = {
+      ...shieldRecord(),
+      kind: 'shield-xchain',
+      meta: {
+        amount: 3_000_000n, cctpFee: 25_388n, protocolFee: 14_873n,
+        fromChainId: 84532, feeCacheId: 'x',
+      },
+    } as unknown as TxRecord
+    render(<ActivityReceipt record={record} open onClose={vi.fn()} />)
+    expect(screen.getByText('2.959739 USDC')).toBeInTheDocument()
+    expect(screen.getByText('0.040261 USDC')).toBeInTheDocument()
   })
 
   it('disables View on explorer without a source tx hash', () => {

@@ -50,8 +50,12 @@ export type EventRegistry = {
   // SDK's `sync.quicksync` telemetry via `sdk-telemetry.ts`. Block numbers + booleans only.
   //   'served'                — the indexer batch verified against the on-chain root (tailCovered =
   //                             the indexer lagged head and RPC covered the remainder)
-  //   'root-mismatch-fallback'— the indexer batch failed root-verify → discarded, range RPC-rescanned
-  'sdk.quicksync':            { outcome: 'served' | 'root-mismatch-fallback'; fromBlock: number; head: number; tailCovered: boolean }
+  //   'root-mismatch-fallback'— the indexer batch was discarded → range RPC-rescanned. `outcome` keeps
+  //                             its two historical values; `reason` disambiguates WHY it was discarded
+  //                             (the label conflated ≥4 causes — see @armada/sdk QuickSyncReason). Set
+  //                             only on fallback; `status` carries the non-OK HTTP code for the
+  //                             `indexer-http-error` cause. Both omitted on the served path.
+  'sdk.quicksync':            { outcome: 'served' | 'root-mismatch-fallback'; fromBlock: number; head: number; tailCovered: boolean; reason?: 'indexer-http-error' | 'schema-mismatch' | 'root-mismatch' | 'position-gap' | 'unknown'; status?: number }
 
   'tx.submitted':             { id: string; kind: TxKind }
   'tx.transition':            { id: string; kind: TxKind; from: TxStage; to: TxStage; executionState: TxRecord['executionState'] }
@@ -96,6 +100,10 @@ export type EventRegistry = {
   'tx.history.scan.completed':{ walletId: string; itemCount: number; recordCount: number; durationMs: number }
   'tx.storage.stale-write':   { id: string; existingSeq: number; incomingSeq: number }
 
+  // Emitted once at bootstrap (main.tsx) right after initSentry(). `enabled` reflects whether a DSN
+  // was configured at build time and Sentry actually initialised — so a DSN-less/misconfigured build
+  // is observable in the live console instead of silently dropping every error report.
+  'app.sentry':               { enabled: boolean }
   'config.deployments.loaded':{ chainCount: number }
 
   'poller.tick':              { scope: string; errorStreak: number }

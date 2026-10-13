@@ -8,6 +8,9 @@ import { useFlowExit } from '@/components/flow/useFlowExit'
 import { DepositReviewSummary } from '@/components/deposit/DepositReviewSummary'
 import { TransferReviewSummary } from '@/components/payments/TransferReviewSummary'
 import { EarnReviewSummary } from '@/components/yield/EarnReviewSummary'
+import { ConsolidationSummary } from '@/components/consolidate/ConsolidationSummary'
+import { ReceivedSummary } from '@/components/dashboard/ReceivedSummary'
+import { frozenApyRate, type YieldRate } from '@/hooks/useYieldRate'
 import { formatUsdcPlain } from '@/lib/format'
 import { displayTxHash, txExplorerUrl } from '@/lib/explorer'
 import { getChainById, getNetworkConfig } from '@/config/network'
@@ -17,6 +20,7 @@ import {
   type DashboardActivityStatus,
 } from '@/components/dashboard/txActivityAdapter'
 import { resolveTxErrorCopy, type TxErrorCopy } from '@/lib/tx/errorCopy'
+import { moneyMoved, txFiguresAs } from '@/lib/fees/txFigures'
 import type { TxRecord } from '@/lib/tx/types'
 import styles from './ActivityReceipt.module.css'
 
@@ -32,6 +36,8 @@ export interface ActivityReceiptProps {
 /** Step-bar labels per originating flow — shown all-confirmed on the receipt (matches the mockup). */
 const DEPOSIT_STEPS = ['Amount', 'Review', 'Confirm']
 const SEND_STEPS = ['Recipient', 'Amount', 'Review', 'Confirm']
+// A merge has no recipient or amount to pick — just review the plan and confirm.
+const MERGE_STEPS = ['Review', 'Confirm']
 
 interface ReceiptView {
   /** Header label (matches the originating flow: Shield / Send / Unshield / Earn). */
@@ -62,27 +68,33 @@ function buildReceiptView(record: TxRecord, ownWalletAddress?: string): ReceiptV
       ? null
       : resolveTxErrorCopy(record.artifacts.error)
   const explorerUrl = txExplorerUrl(record.walletContext.sourceChainId, displayTxHash(record))
+  // A tx that failed or was cancelled before its first on-chain transaction confirmed moved no money: its fees and
+  // totals read "—" (the headline stays, struck through). One that did move money shows what it was charged.
+  const charged = moneyMoved(record)
+  const ifCharged = <T,>(value: T): T | null => (charged ? value : null)
 
   switch (record.kind) {
     case 'shield':
     case 'shield-xchain': {
       const meta = (record as TxRecord<'shield' | 'shield-xchain'>).meta
-      const fee = meta.feeAmount ?? null
-      const netAmount = fee ? meta.amount - fee : meta.amount
+      // received = amount − relayerFee − protocolFee − cctpFee — the single receipt-math source shared
+      // with the completion screen so a completed shield reads identically wherever it's shown.
+      const { headline: amount, fee, netAmount, estimated } = txFiguresAs(record, 'deposit')
       return {
         flowLabel: 'Shield',
         steps: DEPOSIT_STEPS,
         title: 'USDC shield',
-        amount: meta.amount,
+        amount,
         explorerUrl,
         status,
         errorCopy,
         summary: (
           <DepositReviewSummary
             fromChainId={meta.fromChainId}
-            amount={meta.amount}
-            fee={fee}
-            netAmount={netAmount}
+            amount={amount}
+            fee={ifCharged(fee)}
+            netAmount={ifCharged(netAmount)}
+            estimated={estimated}
             confirmedAt={confirmedAt}
           />
         ),
@@ -93,7 +105,8 @@ function buildReceiptView(record: TxRecord, ownWalletAddress?: string): ReceiptV
     case 'unshield-xchain': {
       const meta = (record as TxRecord<'transfer-shielded' | 'unshield-local' | 'unshield-xchain'>)
         .meta
-      const fee = meta.broadcasterFeeAmount
+      // Fee + total from the record alone — the single receipt-math source shared with the confirmation screen.
+      const { headline: amount, fee, totalDeducted, cctpFee } = txFiguresAs(record, 'spend')
       const isPrivate = record.kind === 'transfer-shielded'
       // A public unshield to your own wallet is a withdraw; otherwise (and private 0zk) it's a send.
       const asWithdraw = !isPrivate && isWithdrawToSelf(meta.recipient, ownWalletAddress)
@@ -107,15 +120,16 @@ function buildReceiptView(record: TxRecord, ownWalletAddress?: string): ReceiptV
         flowLabel: asWithdraw ? 'Unshield' : 'Send',
         steps: SEND_STEPS,
         title: asWithdraw ? 'USDC unshield' : 'USDC sent',
-        amount: meta.amount,
+        amount,
         explorerUrl,
         status,
         errorCopy,
         summary: (
           <TransferReviewSummary
             recipient={meta.recipient}
-            fee={fee}
-            totalDeducted={meta.amount + fee}
+            fee={ifCharged(fee)}
+            cctpFee={ifCharged(cctpFee)}
+            totalDeducted={ifCharged(totalDeducted)}
             variant={asWithdraw ? 'withdraw' : 'send'}
             networkName={networkName}
             confirmedAt={confirmedAt}
@@ -125,51 +139,79 @@ function buildReceiptView(record: TxRecord, ownWalletAddress?: string): ReceiptV
     }
     case 'yield-deposit':
     case 'yield-withdraw': {
-      const meta = (record as TxRecord<'yield-deposit' | 'yield-withdraw'>).meta
-      const fee = meta.broadcasterFeeAmount
+      // Single receipt-math source shared with the completion screen so a completed yield op reads
+      // identically wherever it's shown (withdraw's `amount` is the handler-reconciled redeemed gross).
+      const { headline: amount, fee, netAmount, apyBps, estimated: yieldEstimated } = txFiguresAs(record, 'yield')
       const tab = record.kind === 'yield-deposit' ? 'add' : 'withdraw'
-      const netAmount = tab === 'add' ? meta.amount + fee : meta.amount - fee
       const netLabel = tab === 'add' ? 'Total deducted from balance' : 'Received into private balance'
+      // The reviewed net APY is frozen on the record (Tier 4) — reconstruct a minimal rate snapshot so
+      // the "Estimated APY" row shows the historical value. `EarnReviewSummary` reads only `apyBps`.
+      // Absent on pre-capture records → keep the row hidden (unknown, not a fabricated 0%).
+      const rate: YieldRate | null = apyBps !== null ? frozenApyRate(apyBps) : null
       return {
         flowLabel: 'Earn',
         steps: DEPOSIT_STEPS,
         title: tab === 'add' ? 'Vault deposit' : 'Vault withdrawal',
-        amount: meta.amount,
+        amount,
         explorerUrl,
         status,
         errorCopy,
         summary: (
-          // APY row hidden — a historical tx's rate isn't stored, so it can't be shown accurately.
           <EarnReviewSummary
             tab={tab}
-            amount={meta.amount}
-            rate={null}
-            fee={fee}
-            netAmount={netAmount}
+            amount={amount}
+            rate={rate}
+            fee={ifCharged(fee)}
+            netAmount={ifCharged(netAmount)}
+            estimated={yieldEstimated}
             netLabel={netLabel}
             confirmedAt={confirmedAt}
-            showApy={false}
+            showApy={rate !== null}
+          />
+        ),
+      }
+    }
+    case 'consolidate': {
+      const meta = (record as TxRecord<'consolidate'>).meta
+      const { headline, fee } = txFiguresAs(record, 'merge')
+      return {
+        flowLabel: 'Merge notes',
+        steps: MERGE_STEPS,
+        title: 'Notes merged',
+        // A merge moves no value — the big numeral is the fee, the only USDC that left the wallet.
+        amount: headline,
+        explorerUrl,
+        status,
+        errorCopy,
+        summary: (
+          <ConsolidationSummary
+            {...(meta.tokenSymbol !== undefined ? { tokenLabel: meta.tokenSymbol } : {})}
+            {...(meta.notesMerged !== undefined ? { notesMerged: meta.notesMerged } : {})}
+            {...(meta.notesCreated !== undefined ? { notesCreated: meta.notesCreated } : {})}
+            fee={ifCharged(fee)}
+            {...(confirmedAt !== undefined ? { confirmedAt } : {})}
           />
         ),
       }
     }
     case 'transfer-shielded-received': {
       const meta = (record as TxRecord<'transfer-shielded-received'>).meta
+      const { headline } = txFiguresAs(record, 'received')
       return {
         flowLabel: 'Received',
         steps: DEPOSIT_STEPS,
         title: 'USDC received',
-        amount: meta.amount,
+        amount: headline,
         explorerUrl,
         status,
         errorCopy,
+        // The recipient pays nothing and the amount is the headline, so no Fees or Total; the sender is anonymous
+        // unless they disclosed their address.
         summary: (
-          <TransferReviewSummary
-            recipient=""
-            fee={null}
-            totalDeducted={meta.amount}
-            variant="send"
-            confirmedAt={confirmedAt}
+          <ReceivedSummary
+            {...(meta.senderShieldedAddress !== undefined ? { senderShieldedAddress: meta.senderShieldedAddress } : {})}
+            {...(meta.memoText !== undefined ? { memoText: meta.memoText } : {})}
+            {...(confirmedAt !== undefined ? { confirmedAt } : {})}
           />
         ),
       }

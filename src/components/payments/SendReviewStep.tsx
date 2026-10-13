@@ -2,8 +2,10 @@
 // ABOUTME: Delegates the summary rows (date, private account, recipient, fees, total + privacy notice) to TransferReviewSummary; keeps the sync-gate notice + submit disabling.
 
 import { Button, modalStepBodyEnter, modalActionRowEnter } from '@/design'
+import type { CctpFeeFigure } from '@/lib/fees/txFigures'
 import { TransferReviewSummary } from './TransferReviewSummary'
 import { FeeUpdatedBanner } from '@/components/flow/FeeUpdatedBanner/FeeUpdatedBanner'
+import { MergeNotesNotice } from '@/components/consolidate/MergeNotesNotice'
 import { formatUsdcPlain } from '@/lib/format'
 import { isShieldedAddress } from '@/lib/address'
 import type { SendFlowVariant } from './SendRecipientStep'
@@ -15,10 +17,13 @@ export interface SendReviewStepProps {
   /** The user's own shielded (Armada) address — rendered as the summary's "From your private account" row. */
   armadaAddress?: string
   amount: bigint
-  /** Inclusive Fee total — broadcaster + protocol + CCTP. Tooltip breaks it down on the input card. */
+  /** The fee charged on top of the amount — the relayer fee (+ any protocol fee). Rendered as "—" when null. */
   fee: bigint | null
-  /** USDC deducted from the user's shielded balance — `amount + fee` across all three kinds. */
-  totalDeducted: bigint
+  /** A cross-chain unshield's CCTP fee — taken from the amount in transit, so not part of `fee` or the total — and
+   *  whether it's still the estimate. Shown on its own row; the Fees row then reads "Relayer fee". */
+  cctpFee?: CctpFeeFigure | null
+  /** USDC deducted from the user's shielded balance — `amount + fee` across all three kinds; null ("—") until the fee is known. */
+  totalDeducted: bigint | null
   /** Destination chain name — shown on the summary's Network row for public (0x) recipients. */
   networkName?: string
   /** Wallet provider name for a public recipient's brand glyph (only when it's the user's own wallet). */
@@ -28,6 +33,9 @@ export interface SendReviewStepProps {
   isSubmitting?: boolean
   /** True when a submit-time fee refetch changed the fee — surfaces the FeeUpdatedBanner. */
   feeUpdated?: boolean
+  /** Set when the wallet is too fragmented for the send — shows the "Too many small notes" callout (with its
+   *  "Merge notes" button) and holds Confirm. */
+  onMergeNotes?: () => void
   onBack: () => void
   onConfirm: () => void
 }
@@ -38,12 +46,14 @@ export function SendReviewStep({
   armadaAddress,
   amount,
   fee,
+  cctpFee = null,
   totalDeducted,
   networkName,
   recipientWalletProvider,
   submitBlockedReason,
   isSubmitting,
   feeUpdated,
+  onMergeNotes,
   onBack,
   onConfirm,
 }: SendReviewStepProps) {
@@ -71,11 +81,14 @@ export function SendReviewStep({
           recipient={recipient}
           armadaAddress={armadaAddress}
           fee={fee}
+          cctpFee={cctpFee}
           totalDeducted={totalDeducted}
           variant={variant}
           networkName={networkName}
           recipientWalletProvider={recipientWalletProvider}
         />
+
+        {onMergeNotes ? <MergeNotesNotice onAction={onMergeNotes} /> : null}
 
         {submitBlockedReason ? (
           <div className={styles.syncNotice} role="status" aria-live="polite">
@@ -100,7 +113,7 @@ export function SendReviewStep({
           showIcon={false}
           className={styles.confirmButton}
           onClick={onConfirm}
-          disabled={Boolean(submitBlockedReason) || isSubmitting}
+          disabled={Boolean(submitBlockedReason) || Boolean(onMergeNotes) || isSubmitting}
         />
       </div>
     </div>

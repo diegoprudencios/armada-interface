@@ -4,20 +4,24 @@
 import { useEffect, useRef, useState } from 'react'
 import { useAtom, useAtomValue } from 'jotai'
 import { openModalAtom, type ModalKind } from '@/state/ui'
-import { preferencesAtom } from '@/state/preferences'
 import { RelayerStatusBanner } from '@/components/RelayerStatusBanner'
 import { shieldedUsdcAtom, shieldedUsdcSpendableAtom, yieldSharesAtom } from '@/state/wallet'
 import { useTx } from '@/hooks/useTx'
 import { useFees } from '@/hooks/useFees'
 import { useSpendableSyncGate } from '@/hooks/useSpendableSyncGate'
-import { useYieldRate } from '@/hooks/useYieldRate'
+import { useRelayerSubmitBlock } from '@/hooks/useRelayerSubmitBlock'
+import { frozenApyRate, useYieldRate } from '@/hooks/useYieldRate'
 import { getNetworkConfig } from '@/config/network'
 import { formatUsdcAmount, parseUsdcInput } from '@/lib/format'
 import { computeFeeBreakdown, userFeeForKind } from '@/lib/relayer'
+import { withdrawBelowFee } from '@/lib/fees/displayFees'
+import { txFiguresAs } from '@/lib/fees/txFigures'
+import type { TxDraft } from '@/lib/tx/types'
+import type { FlowFeeBreakdown } from '@/components/ui/FeeBreakdownTooltip'
 import { isShieldedAddress } from '@/lib/address'
 import { displayTxHash, txExplorerUrl } from '@/lib/explorer'
 import { canRetryTx } from '@/lib/tx/executor'
-import { resolveFreshQuote } from '@/lib/tx/submitQuote'
+import { QUOTE_PENDING_REASON, resolveFreshQuote } from '@/lib/tx/submitQuote'
 import { sharesToUsdc } from '@/lib/yield'
 import { assertSpendableForFeeOnTop } from '@/lib/tx/spendable'
 import {
@@ -33,6 +37,9 @@ import { EarnInputStepContent, EarnInputStepFooter, type EarnTab } from './EarnI
 import { useDisplayFees } from '@/hooks/useDisplayFees'
 import { EarnReviewStep } from './EarnReviewStep'
 import { EarnCompleteStep } from './EarnCompleteStep'
+import { useMergeNotes } from '@/hooks/useMergeNotes'
+import { useSpendCheck } from '@/hooks/useSpendCheck'
+import type { BlockedSpend } from '@/lib/shielded/merge-intent'
 
 type LocalStep = FlowStep
 
@@ -42,8 +49,6 @@ export function EarnModal() {
   const [openModal, setOpenModal] = useAtom(openModalAtom)
   const isOpen = EARN_KINDS.includes(openModal)
   const initialTab: EarnTab = openModal === 'yield-withdraw' ? 'withdraw' : 'add'
-  // A6 — frozen into the record meta at submit-time so a mid-flight toggle doesn't strand the handler.
-  const prefs = useAtomValue(preferencesAtom)
 
   // Form state
   const [tab, setTab] = useState<EarnTab>(initialTab)
@@ -70,7 +75,8 @@ export function EarnModal() {
 
   // Source data. The USDC leg (deposit amount + the withdraw-fee reserve + the fee-on-top guard) draws
   // from SPENDABLE only, so a not-yet-final ("pending") note can't be used; `pendingUsdc` is
-  // display-only (0 on local Anvil). Yield shares aren't split yet — see readSdkYieldShares TODO.
+  // display-only (0 on local Anvil). Yield shares are the whole vault position (spendable + pending); the
+  // withdraw Max is the SDK's spendable-only max instead (below).
   const shieldedUsdc = useAtomValue(shieldedUsdcAtom)
   const shieldedUsdcSpendable = useAtomValue(shieldedUsdcSpendableAtom)
   const yieldShares = useAtomValue(yieldSharesAtom)
@@ -80,7 +86,7 @@ export function EarnModal() {
     yieldShares !== null && yieldRate !== null ? sharesToUsdc(yieldShares, yieldRate.rate) : null
   const spendableUsdc = shieldedUsdcSpendable ?? 0n
   const max = tab === 'add' ? spendableUsdc : earningUsdc ?? 0n
-  // Pending only applies to the USDC deposit leg; the withdraw tab's max is share-derived.
+  // Pending only applies to the USDC deposit leg; the withdraw tab's max is share-derived (`inputMax`, below).
   const pendingUsdc = tab === 'add' ? (shieldedUsdc ?? 0n) - spendableUsdc : 0n
 
   const { value: amount } = parseUsdcInput(amountStr)
@@ -91,26 +97,43 @@ export function EarnModal() {
   // Yield ops spend the user's shielded USDC (deposit) or shielded yield shares (withdraw).
   // Either way, we need a successful first sync before letting the user submit.
   const syncGate = useSpendableSyncGate()
-  // A4 — yield ops are relayer-mediated. Fee comes from the quote's crossContract tier.
+  // A4 — yield ops are relayer-mediated. Fee comes from the quote's crossContract tier. Both kinds
+  // (deposit + withdraw) submit via the relayer's broadcaster path; there's no wallet-submit fallback
+  // (that would link the user's EVM address to a shielded spend — see #23).
   const yieldKind: 'yield-deposit' | 'yield-withdraw' = tab === 'add' ? 'yield-deposit' : 'yield-withdraw'
-  // yield-withdraw now uses the same submission model as every other kind: the user's `submitFromWallet`
-  // preference decides wallet vs. relayer. #312's fee-from-proceeds design removed the old blocker — the
-  // withdraw is a single Transaction and the relayer fee is shielded to the relayer's 0zk address (bound
-  // in adaptParams), so it fits the standard relayer/broadcaster path. NOTE: for the relayer (gasless)
-  // path to succeed end-to-end, the relayer's broadcaster-fee verifier must accept the new
-  // `redeemAndShield` selector and confirm the fee-shield output targets its 0zk address — tracked at
-  // #312 (relayer side). Users can fall back to wallet submission via the `submitFromWallet` preference.
-  const effectiveUseWalletOverride = prefs.submitFromWallet
-  // When the user-wallet path is in effect, no broadcaster fee is baked into the proof — the
-  // user pays gas in ETH instead.
-  const fee: bigint = effectiveUseWalletOverride ? 0n : userFeeForKind(yieldKind, amount, quote)
+  const quotedFee: bigint = userFeeForKind(yieldKind, amount, quote)
+  // Vault actions never split. They're planned — on the amount and review steps, like a private send — so
+  // a wallet too fragmented for one is offered "Merge notes" before anything is attempted. A deposit spends
+  // USDC (+ its fee note, whose planned value is the fee: the SDK folds small change into it when that's
+  // what makes it fit); a withdrawal spends vault shares (its fee is taken contract-side — no fee note, so
+  // it keeps the quoted fee), estimated at the current rate.
+  // Nothing is planned or priced until the relayer quote loads: its per-proof fee would read 0, and a figure priced at
+  // 0 would show a zero fee (spec G-4).
+  const quotePending = quote === null
+  const vaultSpend: BlockedSpend | null =
+    quotePending ? null
+    : tab === 'add' ? { kind: 'yield-deposit', amount, perProofFee: quotedFee }
+    : yieldRate !== null && yieldRate.rate > 0n
+      ? { kind: 'yield-withdraw', amount: (amount * 1_000_000_000_000_000_000n) / yieldRate.rate, perProofFee: 0n }
+      : null
+  const vaultToken = tab === 'add' ? 'usdc' : 'shares'
+  const spendCheck = useSpendCheck({
+    enabled: isOpen && (step === 'input' || step === 'review'),
+    spend: vaultSpend,
+    token: vaultToken,
+    balanceKey: `${spendableUsdc}:${yieldShares ?? ''}`,
+  })
+  // The deposit's fee is its plan's; the quote only stands in for the arithmetic below until it's known
+  // (the fee itself reads as pending / "—" meanwhile). A withdrawal's fee is the quote.
+  const isDeposit = tab === 'add'
+  const fee: bigint = isDeposit ? (spendCheck.fee ?? quotedFee) : quotedFee
   // Both yield ops are fee-on-top in `computeFeeBreakdown`'s model, but the balance flows differ:
   //   - Add Funds: user unshields (amount + fee) USDC. `totalDeducted = amount + fee` is the
   //     literal private-balance debit. `recipientReceives = amount` is what the vault gains.
-  //   - Withdraw: vault redeems `amount` USDC, ALL of it shields back to user. The broadcaster
-  //     fee comes from a SEPARATE unshield of user's pre-existing private USDC (see
-  //     adapter.redeemAndShield + SDK CrossContractCalls broadcaster handling). Net private
-  //     balance change is +(amount - fee); vault balance drops by `amount`-worth of shares.
+  //   - Withdraw: vault redeems `amount` USDC; the broadcaster fee is skimmed from THOSE proceeds
+  //     (contract-side re-shield to the relayer, bound into adaptParams — see yield-sdk
+  //     redeemAndShield). The user receives the NET `amount - fee` into their private balance and
+  //     their pre-existing private USDC is UNTOUCHED; vault balance drops by `amount`-worth of shares.
   const hubChainId = getNetworkConfig().hub.chainId
   const { fees: displayFees, isLoading: feeLoading } = useDisplayFees(
     yieldKind,
@@ -125,51 +148,86 @@ export function EarnModal() {
     max,
     { protocolFee: displayFees.protocolFee },
   )
-  const flowBreakdown = {
-    broadcasterFee: fee,
-    recipientReceives,
-    totalDeducted,
-    recipientLabel: tab === 'add' ? 'Vault receives' : "You'll receive into private balance",
-  }
-  // For withdraw the fee doesn't come from the vault — it's debited from private USDC via a
-  // separate unshield in the same proof. Reserving `fee` against the vault `max` would collapse
-  // the typeable cap to 0 whenever `fee >= vault balance` (e.g. a $0.50 fee on a $0.40 vault
-  // balance), even though the user can perfectly well withdraw the full $0.40 as long as their
-  // private balance covers the fee. The private-USDC sufficiency check is enforced via the
-  // pre-flight `continueBlockedReason` below; here we just expose the full vault balance as
-  // typeable.
-  const inputMax: bigint = tab === 'add' ? feeOnTopInputMax : max
+  // For withdraw the fee is skimmed from the redeemed proceeds, not reserved on top, so the typeable
+  // cap is the FULL vault balance — don't subtract the fee from `max`. The only lower bound is that
+  // the withdrawal must exceed its own fee (else the redeem can't pay it); that's enforced via the
+  // pre-flight `continueBlockedReason` below.
+  // A deposit's Max is the SDK's unshield max (one proof, one tree), falling back to the one-fee cap until
+  // it's known. A withdrawal's is every share one proof can redeem — spendable shares only, one tree (the SDK's
+  // max, in shares) — at the current rate, falling back to the vault position until it's known (YD-16).
+  const maxShares: bigint | null = isDeposit ? null : spendCheck.maxInput
+  const withdrawMax: bigint | null =
+    maxShares !== null && yieldRate !== null ? sharesToUsdc(maxShares, yieldRate.rate) : null
+  const inputMax: bigint = tab === 'add' ? (spendCheck.maxInput ?? feeOnTopInputMax) : (withdrawMax ?? max)
   // Per-tab display values handed down to the step components. The step components stay dumb;
   // EarnModal owns the per-tab semantic translation.
   //
   // Total displayed fee (broadcaster + any protocol fee) — the figure shown on the summary's
   // "Fees" row. Hoisted so the net-received total below subtracts the SAME number.
   const displayFeeTotal: bigint = fee + displayFees.protocolFee
-  // For withdraw, the vault redeem proceeds (`amount`) shield back to private balance IN FULL,
-  // while the broadcaster fee is unshielded from the user's pre-existing private USDC on a
-  // separate leg. Both hit the same private balance, so the honest "You'll receive into private
-  // balance" total is the NET change: `amount - fee`. The itemized "Your withdrawal" and "Fees"
-  // rows above keep the two legs visible. When the fee exceeds the withdrawal the net goes
-  // negative — shown as-is (a withdraw that costs more in fees than it returns is economically
-  // losing but permitted).
-  const displayNetAmount: bigint = tab === 'add' ? totalDeducted : amount - displayFeeTotal
+  // The record this vault op will submit, built once from the reviewed figures: Review renders it (through
+  // txFigures, like every later surface) and submit sends it, so the stored record is what Review showed. For
+  // withdraw, the vault redeems `amount` USDC and the broadcaster fee is skimmed from those proceeds
+  // (contract-side), so the user receives the NET `amount - fee` into their private balance; pre-existing private
+  // USDC is untouched. A withdrawal at or below its own fee is blocked at review (see below), so that net is
+  // always ≥ 0. No deposit draft (and "—" for its fee and total) until its plan prices it.
+  const reviewedApy = yieldRate !== null ? { apyBps: yieldRate.apyBps } : {}
+  const reviewedBroadcaster = {
+    feeCacheId: quote?.cacheId ?? '',
+    broadcasterShieldedAddress: quote?.broadcasterShieldedAddress ?? '',
+  }
+  const reviewed: TxDraft<'yield-deposit' | 'yield-withdraw'> | null =
+    quotePending ? null
+    : isDeposit
+      ? spendCheck.fee === null
+        ? null
+        : {
+            kind: 'yield-deposit',
+            meta: { amount, ...reviewedBroadcaster, broadcasterFeeAmount: spendCheck.fee, broadcasterFeePerProof: quotedFee, ...reviewedApy },
+          }
+      : {
+          kind: 'yield-withdraw',
+          // The shares to redeem are re-read at submit against the freshest rate (slippage protection).
+          // The amount is the quote-time estimate until the handler reads the actual redeemed gross.
+          meta: { amount, ...reviewedBroadcaster, shares: 0n, broadcasterFeeAmount: quotedFee, ...reviewedApy, amountIsEstimate: true },
+        }
+  const reviewFigures = reviewed ? txFiguresAs(reviewed, 'yield') : null
+  // The amount card's fee breakdown. A deposit is fee-on-top: the vault receives the amount, the balance is debited
+  // amount + fee. A withdrawal's fee comes out of the redeemed proceeds instead — the private balance isn't debited,
+  // so there's no "Total deducted", and what arrives is the Review draft's net (spec YD-12, YD-13).
+  const flowBreakdown: FlowFeeBreakdown = isDeposit
+    ? { broadcasterFee: fee, recipientReceives, totalDeducted, recipientLabel: 'Vault receives' }
+    : {
+        broadcasterFee: fee,
+        feeFromProceeds: true,
+        ...(reviewFigures ? { recipientReceives: reviewFigures.netAmount } : {}),
+        recipientLabel: "You'll receive into private balance",
+      }
   const displayNetLabel: string =
     tab === 'add' ? 'Total deducted from balance' : "You'll receive into private balance"
   // Past-tense variant for the confirmed screen — the review says "You'll receive…", the
   // completed screen says "Received…" for the same withdraw net.
   const completeNetLabel: string =
     tab === 'add' ? 'Total deducted from balance' : 'Received into private balance'
-  // Pre-flight: the withdraw broadcaster fee is unshielded from the user's PRE-EXISTING private
-  // USDC (the proof needs a USDC UTXO; the redeem proceeds aren't available at proof-construction
-  // time). If the user's private USDC is below the fee, proof gen will fail 20-30s in. Block at
-  // submit-time with a clear reason instead. Only enforced when we have a real fee quote — pre-quote
-  // we don't know the number yet.
-  const withdrawFeeShortfall = tab === 'withdraw' && fee > 0n && spendableUsdc < fee
+  // Pre-flight: the withdraw fee is skimmed from the redeemed proceeds (contract-side re-shield to
+  // the relayer — see yield-sdk redeemAndShield), so the user needs NO pre-existing private USDC. The
+  // only uncoverable case is a withdrawal that doesn't exceed its own fee — the redeem can't pay a fee
+  // larger than its proceeds (it would revert) and a net-zero withdrawal is pointless. Block that at
+  // submit-time. Only enforced when we have a real fee quote — pre-quote the number is unknown.
+  // `amount > 0n` so the shortfall alert only surfaces once the user has actually typed an amount —
+  // an empty field (amount 0) is "nothing entered yet", not "too small" (mirrors ShieldAmountStep's
+  // `tooSmall` / useShieldFlow's `duplicateWarning` gating).
+  const withdrawFeeShortfall = tab === 'withdraw' && amount > 0n && withdrawBelowFee(amount, displayFeeTotal)
   const withdrawFeeBlockedReason: string | null = withdrawFeeShortfall
-    ? `Not enough private USDC to cover the ${formatUsdcAmount(fee)} fee — add some first`
+    ? `Withdrawal is smaller than the ${formatUsdcAmount(displayFeeTotal)} fee — withdraw more`
     : null
-  // Composed gate for the review step — sync gate OR private-USDC shortfall.
-  const submitBlockedReason: string | null = syncGate.reason || withdrawFeeBlockedReason
+  // Both yield kinds are relayer-submitted with no wallet fallback (#23) — block Confirm when the
+  // relayer is unavailable.
+  const relayerBlock = useRelayerSubmitBlock(isOpen)
+  // Composed gate for the review step — sync gate OR private-USDC shortfall OR relayer unavailable.
+  const submitBlockedReason: string | null =
+    syncGate.reason || withdrawFeeBlockedReason || relayerBlock || (quotePending ? QUOTE_PENDING_REASON : null)
+    || spendCheck.blockReason
 
   // Two useTx hooks; only one gets a record per flow.
   const txDeposit = useTx({ kind: 'yield-deposit' })
@@ -179,6 +237,14 @@ export function EarnModal() {
     : submittedKind === 'yield-withdraw' ? txWithdraw
     : null
   const record = activeTx?.record ?? null
+  // A spend blocked by fragmentation offers "Merge notes" on its error screen (a consolidate tx).
+  const { remedyFor, openMerge } = useMergeNotes()
+
+  // Completion-screen figures, from the record — its meta is authoritative: for WITHDRAW the handler reconciles
+  // meta.amount to the ACTUAL redeemed gross (shares × execution-rate), so "confirm" shows the real figure identical
+  // to the activity receipt, not the submit-time estimate. Deposit amount is exact at submit (no rate drift).
+  // Complete only shows post-submit, when the record exists.
+  const completeReceipt = record ? txFiguresAs(record, 'yield') : null
 
   // Reset on close + sync initial tab when the entry-point modal kind changes.
   // Also pull a fresh rate on open so the APY hint + max-balance reflect current state — the
@@ -232,7 +298,7 @@ export function EarnModal() {
       // if the fee moved since Review, bounce back with the banner rather than silently swapping it.
       const { quote: activeQuote, feeChanged: changed } = await resolveFreshQuote({
         refresh,
-        reviewedFee: fee,
+        reviewedFee: quotedFee,
         feeOf: (s) => userFeeForKind(yieldKind, amount, s),
       })
       if (!activeQuote) {
@@ -252,26 +318,33 @@ export function EarnModal() {
             'problem persists, the relayer may be misconfigured.',
         )
       }
+      // A withdrawal's fee is the quote (taken contract-side from the proceeds — no fee note to plan).
       const broadcasterFeeAmount = BigInt(activeQuote.fees.crossContract)
       const broadcasterShieldedAddress = activeQuote.broadcasterShieldedAddress
       if (tab === 'add') {
+        // The deposit is re-planned at the fresh quote: the wallet's notes may plan differently than at
+        // review (a sync landed), e.g. change that can no longer be folded into the fee. A different
+        // total means the user hasn't approved it — re-review.
+        const perProofFee = userFeeForKind(yieldKind, amount, activeQuote)
+        const freshFee = await spendCheck.priceAt(perProofFee)
+        if (reviewed?.kind !== 'yield-deposit' || freshFee !== reviewed.meta.broadcasterFeeAmount) {
+          await spendCheck.invalidate()
+          setFeeChanged(true)
+          setStep('review')
+          return
+        }
         // S-M5: a deposit unshields amount + fee from the shielded balance (fee-on-top), so
-        // re-validate against the FRESH fee before proof gen. Wallet-override pays native gas
-        // separately, so no shielded fee applies there. (Withdraw takes its fee from the redeemed
-        // output, not the share balance — no fee-on-top check needed.)
+        // re-validate against the FRESH fee before proof gen. (Withdraw takes its fee from the
+        // redeemed output, not the share balance — no fee-on-top check needed.)
         assertSpendableForFeeOnTop({
           amount,
-          fee: effectiveUseWalletOverride ? 0n : broadcasterFeeAmount,
+          fee: freshFee,
           balance: max,
         })
         setSubmittedKind('yield-deposit')
-        submittedId = await txDeposit.submit({
-          amount,
-          feeCacheId,
-          broadcasterFeeAmount,
-          broadcasterShieldedAddress,
-          useWalletOverride: effectiveUseWalletOverride,
-        })
+        // The reviewed draft (incl. the reviewed net APY, frozen so the receipt can show it — persisted for rescan
+        // via selfMetadata), with the fresh quote's cache id + broadcaster address.
+        submittedId = await txDeposit.submit({ ...reviewed.meta, feeCacheId, broadcasterShieldedAddress })
       } else {
         setSubmittedKind('yield-withdraw')
         // Slippage protection: re-read the vault rate just before computing shares so the
@@ -280,17 +353,27 @@ export function EarnModal() {
         // below USDC's display precision.
         const freshRate = await refreshYieldRate()
         const effectiveRate = freshRate ?? yieldRate
+        // Max redeems exactly the shares it offered: converting its amount back to shares would round down and
+        // leave a dust note (more if the rate rose since review).
         const shares =
-          effectiveRate !== null && effectiveRate.rate > 0n
-            ? (amount * 1_000_000_000_000_000_000n) / effectiveRate.rate
-            : 0n
+          maxShares !== null && amount === inputMax
+            ? maxShares
+            : effectiveRate !== null && effectiveRate.rate > 0n
+              ? (amount * 1_000_000_000_000_000_000n) / effectiveRate.rate
+              : 0n
+        if (reviewed?.kind !== 'yield-withdraw' || broadcasterFeeAmount !== reviewed.meta.broadcasterFeeAmount) {
+          setFeeChanged(true)
+          setStep('review')
+          return
+        }
+        // The reviewed draft, with the fresh quote's cache id + broadcaster address, the shares at the freshest
+        // rate, and that rate's net APY — frozen so the receipt can show it (persisted for rescan via selfMetadata).
         submittedId = await txWithdraw.submit({
-          amount,
+          ...reviewed.meta,
           feeCacheId,
           shares,
-          broadcasterFeeAmount,
           broadcasterShieldedAddress,
-          useWalletOverride: effectiveUseWalletOverride,
+          ...(effectiveRate !== null ? { apyBps: effectiveRate.apyBps } : {}),
         })
       }
       if (submittedId === null) return
@@ -345,12 +428,12 @@ export function EarnModal() {
             pending={pendingUsdc}
             displayFees={displayFees}
             flowBreakdown={flowBreakdown}
-            feeLoading={feeLoading}
+            feeLoading={feeLoading || quotePending || (isDeposit && spendCheck.pending)}
+            feeResolving={quotePending || (isDeposit && spendCheck.pending)}
+            feeUnavailable={isDeposit && spendCheck.error !== null}
             gasChainId={hubChainId}
-            // Both tabs are relayer-mediated (gasless) unless the user opts into wallet submission
-            // via `submitFromWallet`. `effectiveUseWalletOverride` encodes that; the input step shows
-            // the gas notice when it's true.
-            gaslessMode={!effectiveUseWalletOverride}
+            // Both tabs are relayer-mediated (gasless) — no wallet-submit fallback (#23).
+            gaslessMode={true}
             rate={yieldRate}
             continueBlockedReason={withdrawFeeBlockedReason}
             inputRef={amountInputRef}
@@ -372,11 +455,17 @@ export function EarnModal() {
           tab={tab}
           amount={amount}
           rate={yieldRate}
-          // Inclusive Fee total — broadcaster + protocol. No CCTP on yield kinds.
-          fee={displayFeeTotal}
-          netAmount={displayNetAmount}
+          // Inclusive Fee total — broadcaster + protocol. No CCTP on yield kinds. "—" (fee and total) until
+          // the deposit's plan prices it: the quote would suggest it fits, then jump.
+          fee={reviewFigures?.fee ?? null}
+          netAmount={reviewFigures?.netAmount ?? null}
           netLabel={displayNetLabel}
+          // Withdraw redeems fixed shares at the execution-rate → the net received is an estimate.
+          estimated={reviewFigures?.estimated ?? tab === 'withdraw'}
           submitBlockedReason={submitBlockedReason}
+          {...(spendCheck.remedy === 'merge-notes' && vaultSpend !== null
+            ? { onMergeNotes: () => openMerge({ token: vaultToken, blocked: vaultSpend }) }
+            : {})}
           feeUpdated={feeChanged}
           onBack={() => setStep('input')}
           isSubmitting={isSubmitting}
@@ -384,16 +473,18 @@ export function EarnModal() {
         />
       )}
       {step === 'progress' && <ProgressStep record={record} />}
-      {step === 'complete' && (
+      {step === 'complete' && completeReceipt && (
         <EarnCompleteStep
           tab={tab}
-          amount={amount}
-          rate={yieldRate}
-          // Inclusive Fee total — broadcaster + protocol. No CCTP on yield kinds.
-          fee={displayFeeTotal}
-          // Per-tab net figure: Add debits `amount + fee`; Withdraw nets `amount - fee` into
-          // private balance (the broadcaster fee is a separate proof leg out of existing private USDC).
-          netAmount={displayNetAmount}
+          amount={completeReceipt.headline}
+          // The net APY the user reviewed, frozen on the record — not the live rate, refreshed after completion.
+          rate={completeReceipt.apyBps !== null ? frozenApyRate(completeReceipt.apyBps) : null}
+          fee={completeReceipt.fee}
+          // Per-tab net figure derived from the (reconciled) record: Add debits `amount + fee`;
+          // Withdraw nets `amount - fee` into private balance (the fee is skimmed from the redeemed
+          // proceeds). `amount` is the actual redeemed gross once the handler reconciles it.
+          netAmount={completeReceipt.netAmount}
+          estimated={completeReceipt.estimated}
           netLabel={completeNetLabel}
           confirmedAt={record?.updatedAt ?? Date.now()}
           explorerUrl={txExplorerUrl(record?.walletContext.sourceChainId, displayTxHash(record))}
@@ -406,6 +497,7 @@ export function EarnModal() {
       )}
       {step === 'error' && (
         <ErrorStep
+          remedy={remedyFor(record)}
           error={record?.artifacts.error ?? null}
           message={submitError ?? undefined}
           explorerUrl={txExplorerUrl(record?.walletContext.sourceChainId, displayTxHash(record))}

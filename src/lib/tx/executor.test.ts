@@ -11,6 +11,11 @@ import { cacheClear } from '../cache'
 import { setUnlocked, clear as clearKeyManager } from '../shielded/keyManager'
 import { isTerminalState, type TxError, type TxRecord } from './types'
 
+// The failure reporter's own behaviour is unit-tested in failureReport.test.ts; here we only assert
+// the executor invokes it once per failed settle (the single-chokepoint wiring).
+const failureReportMock = vi.hoisted(() => ({ reportTerminalFailure: vi.fn() }))
+vi.mock('./failureReport', () => ({ reportTerminalFailure: failureReportMock.reportTerminalFailure }))
+
 function makeRecord(overrides: Partial<TxRecord> = {}): TxRecord {
   return {
     id: 'ulid-test-1',
@@ -187,6 +192,71 @@ describe('expiry guard (P0-5)', () => {
     expect(after?.executionState).toBe('failed')
     expect(after?.artifacts.error?.code).toBe('TX_REVERTED')
     expect(after?.artifacts.error?.message).toBe('reverted on chain')
+    expect(after?.updatedSeq).toBe(2)
+  })
+
+  it('reports the failure once when a handler settles a record to failed', async () => {
+    failureReportMock.reportTerminalFailure.mockClear()
+    const store = getDefaultStore()
+    const handler: StageHandler<'shield'> = {
+      kind: 'shield',
+      resumableFrom: ['submit-relayer'],
+      run: async (record, ctx) => {
+        await ctx.upsert(markFailed(record, { code: 'OTHER', message: 'circuit fetch … → 404' }))
+      },
+    }
+    registerHandler(handler)
+
+    const rec = makeRecord({
+      id: 'ulid-report-fail',
+      executionState: 'active',
+      stage: 'build-proof',
+      stagesCompleted: [],
+      updatedSeq: 1,
+      createdAt: Date.now(),
+    })
+    store.set(upsertTxAtom, rec)
+
+    executeTx(rec.id)
+
+    await waitTerminalThenSettle(rec.id, 'failed')
+    expect(failureReportMock.reportTerminalFailure).toHaveBeenCalledTimes(1)
+    const reported = failureReportMock.reportTerminalFailure.mock.calls[0]![0] as TxRecord
+    expect(reported.id).toBe('ulid-report-fail')
+    expect(reported.artifacts.error?.code).toBe('OTHER')
+  })
+
+  // No-progress backstop (#4): a handler that returns without advancing / parking / terminating would
+  // busy-loop the chain (e.g. a resume landing on a stage with no `switch` case). The loop must detect
+  // the no-op and fail the record `STUCK` instead of spinning until the lifecycle budget.
+  it('fails a record STUCK when the handler returns without making progress', async () => {
+    const store = getDefaultStore()
+    let runCalls = 0
+    const noProgress: StageHandler<'shield'> = {
+      kind: 'shield',
+      resumableFrom: ['submit-relayer'],
+      // Returns immediately, never upserts — the pathological no-case fall-through.
+      run: async () => { runCalls += 1 },
+    }
+    registerHandler(noProgress)
+
+    const rec = makeRecord({
+      id: 'ulid-no-progress',
+      executionState: 'active',
+      stage: 'submit-relayer',
+      stagesCompleted: ['build-proof'],
+      updatedSeq: 1,
+      createdAt: Date.now(), // well within budget — a busy-loop would spin, not expire
+    })
+    store.set(upsertTxAtom, rec)
+
+    executeTx(rec.id)
+
+    const after = await waitTerminalThenSettle(rec.id, 'failed')
+    expect(after?.artifacts.error?.code).toBe('STUCK')
+    // The guard tripped on the FIRST no-op iteration — run() was not called in a loop.
+    expect(runCalls).toBe(1)
+    // Exactly one transition (the STUCK markFailed) on top of the seeded seq 1.
     expect(after?.updatedSeq).toBe(2)
   })
 })

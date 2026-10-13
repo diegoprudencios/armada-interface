@@ -7,6 +7,7 @@ import { lifecycleFor } from './lifecycles'
 import { markCancelled, markDismissed, markExpired, markFailed, markRetrying } from './reducer'
 import { beginHiddenCredit, endHiddenCredit, hiddenMsForRecord } from './hiddenClock'
 import { loadAllTx, putTxIfFresh } from './storage'
+import { reportTerminalFailure } from './failureReport'
 import { isTerminalState } from './types'
 import type { StageFor, TxKind, TxRecord } from './types'
 import { txListAtom, upsertTxAtom } from '@/state/tx'
@@ -410,6 +411,9 @@ async function runHandlerChain(
         },
       }
 
+      const stageBefore = current.stage
+      const seqBefore = current.updatedSeq
+
       await handler.run(current as TxRecord<TxKind>, ctx as ExecutorCtx<TxKind>)
 
       // Reload current state from the atom (handler wrote through ctx.upsert).
@@ -422,11 +426,36 @@ async function runHandlerChain(
       // that reached a terminal state after maxDurationMs (e.g. a long hidden-tab pause counted
       // against the wall-clock cap) would be clobbered from `completed`/`failed` to `expired`,
       // losing the success or the original TxError. (P0-5)
-      if (isTerminalState(current.executionState)) break
+      if (isTerminalState(current.executionState)) {
+        // Single chokepoint for handler-caused failures — covers both the handler's outer catch
+        // and its inner post-broadcast failures (POLL_TIMEOUT / TX_REVERTED) that upsert-and-return
+        // without re-throwing. Emits tx.failed + funnels the unexpected codes to Sentry.
+        if (current.executionState === 'failed') reportTerminalFailure(current)
+        break
+      }
 
       // Handler put us in 'waiting'? Pause the chain; external trigger (e.g. a
       // poller completing, or executeTx being called again) will resume.
       if (current.executionState === 'waiting') break
+
+      // No-progress backstop (#4). Per the handler contract, `run()` must advance the stage, park at
+      // `waiting`, or terminate — writing every transition through `ctx.upsert` (which bumps
+      // `updatedSeq`). If it returned having written NOTHING (same stage AND same seq) yet the record
+      // is neither terminal nor waiting, re-calling `run()` would produce the same no-op → a busy-loop
+      // until the lifecycle budget elapses (e.g. a resume landing on a stage with no `switch` case).
+      // Fail the record loudly instead. Indeterminate (`STUCK`): the tx may already have completed.
+      if (current.stage === stageBefore && current.updatedSeq === seqBefore) {
+        const stuck = markFailed(current, {
+          code: 'STUCK',
+          message: 'This transaction stalled and made no progress. It may still complete on chain — check the explorer.',
+        })
+        await ctx.upsert(stuck as TxRecord<TxKind>)
+        trackError('tx.executor.no-progress', new Error(`handler ${handler.kind} made no progress at stage ${current.stage}`), {
+          scope: 'tx.executor',
+          message: `no-progress backstop tripped: ${handler.kind} at ${current.stage}`,
+        })
+        break
+      }
 
       // Hard-cap on total lifecycle duration — crediting back time the tab was hidden so a
       // backgrounded tab doesn't expire a tx that merely waited while the user was away (T-M5/S-M6).

@@ -47,17 +47,31 @@ function fundGasEndpoint() {
   // The standard Anvil "test test ..." mnemonic account #0 — publicly known. Has 10 000 ETH on
   // every fresh Anvil instance. Safe to hardcode in dev config; never used outside local mode.
   const ANVIL_DEPLOYER_PK = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
-  const RPC_BY_CHAIN_ID: Record<number, string> = {
-    31337: 'http://localhost:8545',
-    31338: 'http://localhost:8546',
-    31339: 'http://localhost:8547',
+  // Resolve a chain's faucet by the chainId embedded INSIDE each CCTP/-v3 manifest, rather than
+  // assuming an ordinal→chain mapping (client1 is not guaranteed to be any particular chain). The app
+  // sends the RPC URL to hit (it knows it from network config), so there's no chainId→RPC map to
+  // drift either.
+  function findFaucetForChain(chainId: number): string | null {
+    let files: string[]
+    try {
+      files = fs.readdirSync(DEPLOYMENTS_DIR).filter((f) => f.endsWith('-v3.json'))
+    } catch {
+      return null
+    }
+    for (const f of files) {
+      try {
+        const m = JSON.parse(fs.readFileSync(path.resolve(DEPLOYMENTS_DIR, f), 'utf-8'))
+        if (m?.chainId === chainId && m?.contracts?.faucet) return m.contracts.faucet as string
+      } catch {
+        // Skip unreadable / non-matching manifest files.
+      }
+    }
+    return null
   }
-  // Maps chainId → secondary manifest filename (the file that carries the faucet address).
-  // Mirrors the deployment naming convention; if it changes, update this map too.
-  const MANIFEST_BY_CHAIN_ID: Record<number, string> = {
-    31337: 'hub-v3.json',
-    31338: 'client-v3.json',
-    31339: 'clientB-v3.json',
+  // The endpoint drips using the Anvil deployer key, so only accept local RPC targets — never let a
+  // caller point this dev endpoint at a remote node.
+  function isLocalRpcUrl(url: unknown): url is string {
+    return typeof url === 'string' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(url)
   }
   const FAUCET_ABI = ['function dripTo(address recipient) external']
 
@@ -81,34 +95,28 @@ function fundGasEndpoint() {
         req.on('data', (chunk: any) => { body += chunk })
         req.on('end', async () => {
           try {
-            const { address, chainId } = JSON.parse(body) as { address: string; chainId: number }
+            const { address, chainId, rpcUrl } = JSON.parse(body) as {
+              address: string
+              chainId: number
+              rpcUrl?: string
+            }
             if (!address || !chainId) {
               res.statusCode = 400
               res.setHeader('Content-Type', 'application/json')
               res.end(JSON.stringify({ error: 'Missing address or chainId' }))
               return
             }
-            const rpcUrl = RPC_BY_CHAIN_ID[chainId]
-            const manifestName = MANIFEST_BY_CHAIN_ID[chainId]
-            if (!rpcUrl || !manifestName) {
+            if (!isLocalRpcUrl(rpcUrl)) {
               res.statusCode = 400
               res.setHeader('Content-Type', 'application/json')
-              res.end(JSON.stringify({ error: `Unknown chainId: ${chainId}` }))
+              res.end(JSON.stringify({ error: 'Missing or non-local rpcUrl' }))
               return
             }
-            const manifestPath = path.resolve(DEPLOYMENTS_DIR, manifestName)
-            if (!fs.existsSync(manifestPath)) {
-              res.statusCode = 500
-              res.setHeader('Content-Type', 'application/json')
-              res.end(JSON.stringify({ error: `Manifest not found: ${manifestName}` }))
-              return
-            }
-            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'))
-            const faucetAddress = manifest?.contracts?.faucet
+            const faucetAddress = findFaucetForChain(chainId)
             if (!faucetAddress) {
               res.statusCode = 500
               res.setHeader('Content-Type', 'application/json')
-              res.end(JSON.stringify({ error: 'Faucet address not in manifest' }))
+              res.end(JSON.stringify({ error: `No faucet manifest found for chainId ${chainId}` }))
               return
             }
             const provider = new ethers.JsonRpcProvider(rpcUrl)
