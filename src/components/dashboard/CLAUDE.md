@@ -7,7 +7,7 @@ Dashboard presentation, ported from the armada-app design mockup. Composed by `p
 | Component / file | Purpose |
 |---|---|
 | `BalanceCard` | The "Private USDC" card: header (shield badge · label · eye/hide toggle), animated balance numeral, action row (SEND · `+` deposit · `↓` receive · `⋯` more menu = Earn/Withdraw/activity toggle), optional vault position bar. |
-| `RollingBalanceValue` | Odometer roll for the balance numeral (intro from zero; re-roll from previous value on change). A re-roll pads the shorter value to line up the decimal point; those padding columns fold to zero width instead of showing zeros, so the row starts as the old value and ends as the new one. Also drives the amount roll in `deposit/DepositAmountCard` and `VaultPositionBar`. |
+| `RollingBalanceValue` | Odometer roll for the balance numeral (intro from zero; re-roll from previous value on change). A re-roll pads the shorter value to line up the decimal point; those padding columns fold to zero width instead of showing zeros, so the row starts as the old value and ends as the new one. `onRollEnd` fires once the last staggered column lands, so a caller swapping in a static value doesn't re-derive the timing. Also drives the amount roll in `deposit/DepositAmountCard` and `VaultPositionBar`. |
 | `BalanceScrambleValue` | Steady-state hide/reveal scramble for the balance + activity amounts. |
 | `VaultPositionBar` | Vault (yield) position row inside BalanceCard; shows earned + APR. |
 | `SendButton`, `ShieldedUsdcBadge`, `TokenBadge` | Small presentational pieces of the card. |

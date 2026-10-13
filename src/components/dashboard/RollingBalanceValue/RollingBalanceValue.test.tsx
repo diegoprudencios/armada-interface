@@ -1,11 +1,24 @@
-// ABOUTME: Tests for RollingBalanceValue's fromValue roll — the decimal-alignment padding columns
-// ABOUTME: collapse instead of showing zeros, so the row starts as the old value and ends as the new one.
+// ABOUTME: Tests for RollingBalanceValue's fromValue roll — padding columns fold instead of showing
+// ABOUTME: zeros, and onRollEnd fires only once the last staggered column has landed.
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { render, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, render, waitFor } from '@testing-library/react'
 import { RollingBalanceValue } from './RollingBalanceValue'
 
 const originalMatchMedia = window.matchMedia
+
+/** Timers the odometer uses: its two-frame kick-off (rAF) and its settle timer (setTimeout). */
+const ROLL_TIMERS = ['setTimeout', 'clearTimeout', 'requestAnimationFrame', 'cancelAnimationFrame'] as const
+
+/**
+ * Run the two-frame kick-off in its own act() so the roll's effects (which schedule the settle
+ * timer) flush at that point, as they would in a browser — act() defers effects to its end.
+ */
+function kickOffRoll() {
+  act(() => {
+    vi.advanceTimersByTime(50)
+  })
+}
 
 /** Report non-reduced motion (setup defaults to reduced) so the odometer actually rolls. */
 beforeEach(() => {
@@ -121,5 +134,74 @@ describe('RollingBalanceValue — fromZero reveal', () => {
     await waitForRollToStart(container)
     expect(shownCount(container)).toBe(columns(container).length)
     expect(container.querySelector('[class*="paddingFold"]')).toBeNull()
+  })
+})
+
+describe('RollingBalanceValue — onRollEnd', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('reports the end of a fromValue roll only once its last staggered column has landed', () => {
+    vi.useFakeTimers({ toFake: [...ROLL_TIMERS] })
+    const onRollEnd = vi.fn()
+    render(
+      <RollingBalanceValue
+        value="10"
+        fromValue="1.123456"
+        mode="fromValue"
+        rollTrigger={1}
+        rollStartMs={0}
+        rollDurationMs={1000}
+        digitStaggerMs={70}
+        onRollEnd={onRollEnd}
+      />,
+    )
+    // The padded row "10.000000" has 8 columns: the last starts 7 × 70ms in and rolls for 1000ms,
+    // plus a one-frame settle buffer → 1570ms. Counting only "10"'s two digits would end at 1150ms.
+    kickOffRoll()
+    act(() => {
+      vi.advanceTimersByTime(1450)
+    })
+    expect(onRollEnd).not.toHaveBeenCalled()
+    act(() => {
+      vi.advanceTimersByTime(200)
+    })
+    expect(onRollEnd).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not restart the roll when the parent re-renders with a new callback', () => {
+    vi.useFakeTimers({ toFake: [...ROLL_TIMERS] })
+    const first = vi.fn()
+    const second = vi.fn()
+    const props = {
+      value: '5',
+      fromValue: '7',
+      mode: 'fromValue' as const,
+      rollTrigger: 1,
+      rollStartMs: 0,
+      rollDurationMs: 1000,
+      digitStaggerMs: 70,
+    }
+    const { rerender } = render(<RollingBalanceValue {...props} onRollEnd={first} />)
+    kickOffRoll()
+    act(() => {
+      vi.advanceTimersByTime(550)
+    })
+    rerender(<RollingBalanceValue {...props} onRollEnd={second} />)
+    act(() => {
+      vi.advanceTimersByTime(600)
+    })
+    // One column: 1000ms + 80ms buffer from the original start, reported to the latest callback.
+    expect(first).not.toHaveBeenCalled()
+    expect(second).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports the end straight away under reduced motion (nothing rolls)', () => {
+    window.matchMedia = ((query: string) =>
+      ({ matches: true, media: query, addEventListener: () => {}, removeEventListener: () => {} }) as unknown as MediaQueryList) as typeof window.matchMedia
+    const onRollEnd = vi.fn()
+    render(<RollingBalanceValue value="5" fromValue="7" mode="fromValue" rollTrigger={1} onRollEnd={onRollEnd} />)
+    expect(onRollEnd).toHaveBeenCalledTimes(1)
   })
 })

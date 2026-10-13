@@ -1,6 +1,6 @@
 // ABOUTME: Odometer-style rolling numeric display that animates balance digits into place.
 // ABOUTME: Ported from the armada-app design mockup.
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import {
   balanceRevealRollDurationMs,
   balanceRevealRollStartMs,
@@ -11,6 +11,8 @@ import styles from './RollingBalanceValue.module.css'
 const DIGIT_SPIN_CYCLES = 1
 /** How long an alignment-padding column takes to fold away (or open) during a fromValue roll. */
 const PADDING_FOLD_MS = 450
+/** Margin after the last column lands before `onRollEnd`, so its final frame has painted. */
+const ROLL_SETTLE_BUFFER_MS = 80
 
 export type BalanceRollMode = 'fromZero' | 'fromValue'
 
@@ -206,6 +208,12 @@ export interface RollingBalanceValueProps {
   rollStartMs?: number
   rollDurationMs?: number
   digitStaggerMs?: number
+  /**
+   * Called once the roll has settled — after the last (staggered) column has landed — or straight
+   * away when nothing rolls (reduced motion / `enableRoll` off). Lets a caller that swaps the
+   * odometer for a static value do so without re-deriving this component's timing.
+   */
+  onRollEnd?: () => void
 }
 
 function DigitColumn({
@@ -272,6 +280,7 @@ export function RollingBalanceValue({
   rollStartMs = balanceRevealRollStartMs(),
   rollDurationMs = balanceRevealRollDurationMs(),
   digitStaggerMs = BALANCE_ROLL_DIGIT_STAGGER_MS,
+  onRollEnd,
 }: RollingBalanceValueProps) {
   const reducedMotion = prefersReducedMotion()
   const shouldRoll = enableRoll && !reducedMotion
@@ -315,6 +324,28 @@ export function RollingBalanceValue({
 
     return () => window.clearTimeout(timer)
   }, [shouldRoll, mode, rollStartMs, rollTrigger, value, fromValue])
+
+  // Keep the latest callback without making it a dependency — a parent re-render passing a new
+  // closure must not restart the settle timer.
+  const onRollEndRef = useRef(onRollEnd)
+  useEffect(() => {
+    onRollEndRef.current = onRollEnd
+  })
+
+  // Every column (padding included) rolls, so the last one starts `(count - 1) × stagger` in.
+  const lastDigitIndex = tokens.filter((token) => token.type === 'digit').length - 1
+
+  useEffect(() => {
+    if (!shouldRoll) {
+      onRollEndRef.current?.()
+      return
+    }
+    if (!animating) return
+    const settleMs =
+      rollDurationMs + Math.max(0, lastDigitIndex) * digitStaggerMs + ROLL_SETTLE_BUFFER_MS
+    const timer = window.setTimeout(() => onRollEndRef.current?.(), settleMs)
+    return () => window.clearTimeout(timer)
+  }, [shouldRoll, animating, rollDurationMs, digitStaggerMs, lastDigitIndex])
 
   const rootClassName = [styles.root, className].filter(Boolean).join(' ')
 
