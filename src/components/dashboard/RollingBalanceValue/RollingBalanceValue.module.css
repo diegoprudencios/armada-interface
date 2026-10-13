@@ -1,4 +1,4 @@
-/* ABOUTME: Styles for RollingBalanceValue — digit columns, roll transition, and separator fade. */
+/* ABOUTME: Styles for RollingBalanceValue — digit columns, roll transition, separator fade, padding fold. */
 /* ABOUTME: Ported from the armada-app design mockup. */
 .root {
   display: inline-flex;

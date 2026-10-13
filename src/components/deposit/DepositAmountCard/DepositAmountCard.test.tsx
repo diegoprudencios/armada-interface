@@ -1,5 +1,5 @@
-// ABOUTME: Tests for DepositAmountCard's balance row — specifically the pendingBalance suffix that
-// ABOUTME: surfaces not-yet-spendable ("pending") notes alongside the available balance.
+// ABOUTME: Tests for DepositAmountCard — pending-balance suffix, amount typing, percent pills and the
+// ABOUTME: amount roll (lifetime + colour), fee caption, and the incomplete-CTA nudge shake.
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { act, render, screen, fireEvent } from '@testing-library/react'
